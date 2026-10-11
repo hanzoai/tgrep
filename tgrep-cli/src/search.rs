@@ -7,7 +7,7 @@ use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tgrep_core::builder;
 use tgrep_core::filetypes;
 use tgrep_core::meta::IndexMeta;
@@ -280,13 +280,10 @@ impl SearchOptions {
         crate::glob_filter::GlobFilter::new(&self.glob, &self.iglob, self.glob_case_insensitive)
     }
 
-    /// The matching-relevant subset, shared with the server path.
-    /// Whether the reply has to carry per-match spans and columns.
+    /// Whether local matching must retain every span on each line.
     ///
-    /// Every consumer of that data is listed here; anything else prints the
-    /// line as the server rendered it, so the arrays would be built, sent,
-    /// parsed and dropped. The check is conservative — when in doubt the data
-    /// is requested, because missing spans degrade output silently.
+    /// Server requests also use this as the default row-detail policy, but
+    /// count-only replies consume per-file totals instead.
     fn wants_match_detail(&self) -> bool {
         self.color.is_enabled()      // highlighting brackets each span
             || self.json             // reports them as `submatches`
@@ -908,12 +905,12 @@ pub fn run(
         && let Ok(info) = ServerInfo::load(&index_dir)
         && let Some((index_root, scope)) = resolve_scope(&index_dir, &root)
     {
-        if let Ok(had_matches) =
-            search_via_server(&info, &root, &index_root, &scope, opts, ci, writer)
-        {
-            return Ok(had_matches);
+        match search_via_server(&info, &root, &index_root, &scope, opts, ci, writer) {
+            Ok(had_matches) => return Ok(had_matches),
+            Err(error) => eprintln!(
+                "Server unavailable or incompatible ({error}), falling back to local index"
+            ),
         }
-        eprintln!("Server unavailable or index coverage not ready, falling back to local index");
     }
 
     // No server — use on-disk index directly (or brute force)
@@ -1030,7 +1027,8 @@ fn server_search_request(
     // match — and most searches never read them. Asking for them only when
     // something will consume them keeps a 21k-hit query from building, sending
     // and parsing 21k arrays that are then dropped.
-    let detail = opts.wants_match_detail();
+    // Counts consume per-file totals; the server still collects every span.
+    let detail = !opts.count_matches && opts.wants_match_detail();
     let positions = opts.wants_position_detail();
 
     let mut request = serde_json::json!({
@@ -1083,6 +1081,11 @@ fn server_search_request(
     request["params"]["hidden"] = serde_json::json!(opts.hidden);
     request["params"]["scope"] = serde_json::json!(scope.prefix());
     request["params"]["max_depth"] = serde_json::json!(opts.max_depth);
+    // Older shared servers reject unknown fields, even when false. Leave
+    // non-counting requests unchanged.
+    if opts.count_matches {
+        request["params"]["count_matches"] = serde_json::json!(true);
+    }
     Ok(request)
 }
 
@@ -1125,6 +1128,31 @@ fn render_server_result(
             .collect()
     } else {
         std::collections::HashSet::new()
+    };
+    let file_stats = if opts.stats || opts.count_matches {
+        result
+            .get("file_stats")
+            .map(|stats| -> Result<Vec<FileMatchStats>> {
+                let stats: Vec<FileMatchStats> = serde_json::from_value(stats.clone())
+                    .context("invalid server per-file match totals")?;
+                Ok(stats
+                    .into_iter()
+                    .filter_map(|mut stats| {
+                        if dropped_binary_files.contains(stats.file.as_str()) {
+                            return None;
+                        }
+                        let rel = scope.relativize(&stats.file, root)?;
+                        if !within_max_depth(&rel, opts) {
+                            return None;
+                        }
+                        stats.file = rel;
+                        Some(stats)
+                    })
+                    .collect())
+            })
+            .transpose()?
+    } else {
+        None
     };
     let scoped;
     let matches = if matches!(scope, IndexScope::Whole) && opts.max_depth.is_none() && !drop_binary
@@ -1199,16 +1227,20 @@ fn render_server_result(
                 writer.write_file(file)?;
             }
         }
-    } else if opts.count || opts.count_matches {
+    } else if opts.count_matches {
+        // Validate every file before writing any counts: a partial or old
+        // response must not mix guessed counts with a local fallback.
+        let counts = original_match_counts(matches, file_stats.as_deref(), opts.invert_match)?;
+        for (file, count) in counts {
+            writer.write_count(file, count)?;
+        }
+    } else if opts.count {
         // `-c` counts matching *lines*, so collapse rows that share a line
         // (`-o` emits one per match) and ignore context rows. This is what the
         // local path reports via `FileMatches::matched_lines`.
-        // `--count-matches` instead sums the spans on each row, which is what
-        // `FileMatches::match_count` reports locally.
         let mut order: Vec<String> = Vec::new();
         let mut lines: std::collections::HashMap<String, std::collections::HashSet<usize>> =
             std::collections::HashMap::new();
-        let mut spans: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         // A binary file is summarised as a single `binary` row rather than one
         // row per match, so it carries its own line count. The local path still
         // prints a real count for it because `-c` returns before the binary
@@ -1231,14 +1263,6 @@ fn render_server_result(
             } else {
                 let line = m.get("line").and_then(|l| l.as_u64()).unwrap_or(0) as usize;
                 lines.entry(file.to_string()).or_default().insert(line);
-                // A row with no spans is still one match (`-v` reports inverted
-                // lines with an empty span list).
-                let n = m
-                    .get("spans")
-                    .and_then(|s| s.as_array())
-                    .map(|s| s.len().max(1))
-                    .unwrap_or(1);
-                *spans.entry(file.to_string()).or_default() += n;
             }
         }
         // Emit in response order; iterating the maps would randomise the file
@@ -1247,13 +1271,7 @@ fn render_server_result(
             let n = exact
                 .get(file)
                 .copied()
-                .or_else(|| {
-                    if opts.count_matches {
-                        spans.get(file).copied()
-                    } else {
-                        lines.get(file).map(|l| l.len())
-                    }
-                })
+                .or_else(|| lines.get(file).map(|l| l.len()))
                 .unwrap_or(0);
             writer.write_count(file, n)?;
         }
@@ -1324,27 +1342,15 @@ fn render_server_result(
         // Apply the same scope to per-file totals as to output rows. The
         // server's `num_matches` includes context rows, and
         // rendered spans can split or merge the original matches.
-        let (num, lines) = if let Some(stats) = result.get("file_stats") {
-            let stats: Vec<FileMatchStats> = serde_json::from_value(stats.clone())?;
+        let (num, lines) = if let Some(stats) = &file_stats {
             let first_file = matches
                 .first()
                 .and_then(|m| m.get("file"))
                 .and_then(|f| f.as_str());
             stats
                 .iter()
-                .filter_map(|s| {
-                    if dropped_binary_files.contains(s.file.as_str()) {
-                        return None;
-                    }
-                    let rel = scope.relativize(&s.file, root)?;
-                    if !within_max_depth(&rel, opts)
-                        || (opts.quiet && first_file != Some(rel.as_str()))
-                    {
-                        return None;
-                    }
-                    Some((s.matches, s.matched_lines))
-                })
-                .fold((0, 0), |(m, l), (fm, fl)| (m + fm, l + fl))
+                .filter(|s| !opts.quiet || first_file == Some(s.file.as_str()))
+                .fold((0, 0), |(m, l), s| (m + s.matches, l + s.matched_lines))
         } else {
             // Older servers only provide rendered rows.
             count_reported_matches(matches)
@@ -2245,12 +2251,61 @@ pub fn build_type_filter(
     defs.build_filter(types, types_not)
 }
 
-/// Optional per-file RPC metadata, independent of rendered match/context rows.
+/// Original per-file RPC totals for stats and counts, independent of rendered rows.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct FileMatchStats {
     pub file: String,
     pub matches: u64,
     pub matched_lines: u64,
+}
+
+fn original_match_counts<'a>(
+    rows: &'a [serde_json::Value],
+    stats: Option<&[FileMatchStats]>,
+    invert_match: bool,
+) -> Result<Vec<(&'a str, usize)>> {
+    let stats = stats.context(
+        "server does not provide per-file match totals required by --count-matches; upgrade the server",
+    )?;
+    let mut by_file = std::collections::HashMap::new();
+    for s in stats {
+        let count = if invert_match {
+            s.matched_lines
+        } else {
+            s.matches
+        };
+        let count = usize::try_from(count).context("server match count exceeds platform limits")?;
+        anyhow::ensure!(
+            by_file.insert(s.file.as_str(), count).is_none(),
+            "server returned duplicate match totals for {}",
+            s.file
+        );
+    }
+    let mut counts = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for row in rows {
+        if !matches!(
+            row.get("type").and_then(|t| t.as_str()).unwrap_or("match"),
+            "match" | "binary"
+        ) {
+            continue;
+        }
+        let file = row
+            .get("file")
+            .and_then(|f| f.as_str())
+            .context("server match is missing its file")?;
+        if seen.insert(file) {
+            let count = by_file
+                .remove(file)
+                .with_context(|| format!("server omitted match totals for {file}"))?;
+            counts.push((file, count));
+        }
+    }
+    anyhow::ensure!(
+        by_file.is_empty(),
+        "server returned match totals without matching files"
+    );
+    Ok(counts)
 }
 
 /// Legacy match and matched-line totals for `--stats`, counted from the rows the
@@ -2764,6 +2819,117 @@ mod tests {
         let request = server_search_request(&IndexScope::Whole, &opts, false).unwrap();
         assert_eq!(request["params"]["positions"], true);
         assert_eq!(request["params"]["detail"], true);
+    }
+
+    #[test]
+    fn count_matches_requests_totals_without_changing_legacy_queries() {
+        for mut opts in [
+            SearchOptions::default(),
+            SearchOptions {
+                color: ColorMode::Always,
+                ..Default::default()
+            },
+            SearchOptions {
+                json: true,
+                ..Default::default()
+            },
+            SearchOptions {
+                vimgrep: true,
+                ..Default::default()
+            },
+            SearchOptions {
+                column: true,
+                ..Default::default()
+            },
+            SearchOptions {
+                only_matching: true,
+                ..Default::default()
+            },
+            SearchOptions {
+                replace: Some("replacement".into()),
+                ..Default::default()
+            },
+            SearchOptions {
+                count: true,
+                ..Default::default()
+            },
+            SearchOptions {
+                files_only: true,
+                ..Default::default()
+            },
+            SearchOptions {
+                quiet: true,
+                ..Default::default()
+            },
+        ] {
+            for stats in [false, true] {
+                opts.stats = stats;
+                opts.count_matches = false;
+                let request = server_search_request(&IndexScope::Whole, &opts, false).unwrap();
+                assert!(request["params"].get("count_matches").is_none());
+                assert_eq!(request["params"]["detail"], opts.wants_match_detail());
+                opts.count_matches = true;
+                let request = server_search_request(&IndexScope::Whole, &opts, false).unwrap();
+                assert_eq!(request["params"]["count_matches"], true);
+                assert_eq!(request["params"]["stats"], stats);
+                assert_eq!(request["params"]["detail"], false);
+                assert_eq!(request["params"]["positions"], opts.wants_position_detail());
+                assert!(opts.match_options().all_spans);
+            }
+        }
+    }
+
+    #[test]
+    fn count_matches_uses_totals_not_rows_and_preserves_inversion() {
+        let rows = [
+            row("match", "b.rs", 1, 1),
+            row("match", "b.rs", 2, 1),
+            row("context", "context.rs", 3, 0),
+            row("match", "a.rs", 1, 3),
+            serde_json::json!({"type":"binary","file":"binary.txt","lines":2}),
+        ];
+        let stats: Vec<FileMatchStats> = serde_json::from_value(serde_json::json!([
+            {"file":"a.rs","matches":3,"matched_lines":1},
+            {"file":"binary.txt","matches":4,"matched_lines":2},
+            {"file":"b.rs","matches":1,"matched_lines":2},
+        ]))
+        .unwrap();
+        assert_eq!(
+            original_match_counts(&rows, Some(&stats), false).unwrap(),
+            [("b.rs", 1), ("a.rs", 3), ("binary.txt", 4)]
+        );
+        assert_eq!(
+            original_match_counts(&rows, Some(&stats), true).unwrap(),
+            [("b.rs", 2), ("a.rs", 1), ("binary.txt", 2)]
+        );
+        assert!(
+            original_match_counts(&[], Some(&[]), false)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn count_matches_rejects_missing_partial_and_duplicate_totals() {
+        let rows = [row("match", "a.rs", 1, 1), row("match", "b.rs", 1, 1)];
+        assert!(original_match_counts(&rows, None, false).is_err());
+        for metadata in [
+            serde_json::json!([]),
+            serde_json::json!([{"file":"a.rs","matches":1,"matched_lines":1}]),
+            serde_json::json!([
+                {"file":"a.rs","matches":1,"matched_lines":1},
+                {"file":"a.rs","matches":1,"matched_lines":1},
+                {"file":"b.rs","matches":1,"matched_lines":1},
+            ]),
+            serde_json::json!([
+                {"file":"a.rs","matches":1,"matched_lines":1},
+                {"file":"b.rs","matches":1,"matched_lines":1},
+                {"file":"extra.rs","matches":1,"matched_lines":1},
+            ]),
+        ] {
+            let stats: Vec<FileMatchStats> = serde_json::from_value(metadata).unwrap();
+            assert!(original_match_counts(&rows, Some(&stats), false).is_err());
+        }
     }
 
     #[test]

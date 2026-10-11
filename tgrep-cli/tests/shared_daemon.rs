@@ -250,7 +250,7 @@ impl Daemon {
         request
     }
 
-    fn raw(&self, request: &Value) -> std::io::Result<Value> {
+    fn raw_response(&self, request: &Value) -> std::io::Result<String> {
         let mut stream =
             TcpStream::connect(("127.0.0.1", self.marker["port"].as_u64().unwrap() as u16))?;
         stream.set_read_timeout(Some(Duration::from_secs(30)))?;
@@ -258,7 +258,11 @@ impl Daemon {
         writeln!(stream, "{request}")?;
         let mut line = String::new();
         BufReader::new(stream).read_line(&mut line)?;
-        Ok(serde_json::from_str(&line)?)
+        Ok(line)
+    }
+
+    fn raw(&self, request: &Value) -> std::io::Result<Value> {
+        Ok(serde_json::from_str(&self.raw_response(request)?)?)
     }
 
     fn try_rpc(&self, method: &str, params: Value) -> std::io::Result<Value> {
@@ -366,6 +370,182 @@ impl Drop for Daemon {
             }
         }
     }
+}
+
+#[test]
+fn multiline_count_matches_uses_shared_per_file_totals() {
+    let mut f = Fixture::new();
+    prepare_multiline_counts(&mut f);
+    let d = f.start(&["--no-watch"]);
+    let lease = d.attach(&f.a, &f.revision);
+    let before = d.lookup(&f.a)["queries"].as_u64().unwrap();
+    let queries = assert_multiline_counts(&f.a.join("counts"), "(via shared daemon v1)");
+    assert_eq!(d.lookup(&f.a)["queries"], before + queries);
+    assert_compact_shared_count_responses(&d, &f.a);
+    d.rpc(
+        "detach",
+        json!({"root":f.a,"view":lease["view"],"lease":lease["lease"]}),
+    );
+}
+
+fn prepare_multiline_counts(f: &mut Fixture) {
+    fs::write(
+        f.a.join("count-heavy.txt"),
+        format!("{}\nb\n", "a".repeat(32 * 1024)),
+    )
+    .unwrap();
+    let root = f.a.join("counts");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("a.txt"), "hello\nworld\n").unwrap();
+    fs::write(
+        root.join("b.txt"),
+        "hello\nworld hello\nworld\nmiss\nhello\nworld\n",
+    )
+    .unwrap();
+    git(&f.a, &["add", "counts"]);
+    git(&f.a, &["commit", "-qm", "multiline counts"]);
+    f.revision = git(&f.a, &["rev-parse", "HEAD"]);
+}
+
+fn assert_compact_shared_count_responses(daemon: &Daemon, root: &Path) {
+    let view = daemon.lookup(root);
+    let mut params = json!({"root":root,"view":view["view"],"query":{}});
+    if daemon.marker["protocol"] == 2 {
+        params["expected_version"] = view["version"].clone();
+    }
+    for engine in ["default", "pcre2"] {
+        for stats in [false, true] {
+            for (pattern, multiline, matches, lines) in [
+                ("a", false, 32 * 1024, 1),
+                (r"a|\nb", true, 32 * 1024 + 1, 2),
+            ] {
+                params["query"] = json!({
+                    "pattern":pattern,"multiline":multiline,"engine":engine,
+                    "glob":["count-heavy.txt"],"count_matches":true,
+                    "stats":stats,"detail":false,
+                });
+                let raw = daemon
+                    .raw_response(&daemon.request("search", params.clone()))
+                    .unwrap();
+                assert!(raw.len() < 40 * 1024, "count response: {} bytes", raw.len());
+                let response: Value = serde_json::from_str(&raw).unwrap();
+                assert!(response.get("error").is_none(), "{response}");
+                assert_eq!(response["result"]["instance"], daemon.marker["instance"]);
+                assert_eq!(response["result"]["protocol"], daemon.marker["protocol"]);
+                let result = if daemon.marker["protocol"] == 2 {
+                    &response["result"]["data"]
+                } else {
+                    &response["result"]
+                };
+                assert_eq!(
+                    result["backend"],
+                    format!("shared-v{}", daemon.marker["protocol"])
+                );
+                assert_eq!(result["ready"], true);
+                assert_eq!(result["view"], view["view"]);
+                assert_eq!(
+                    result["file_stats"],
+                    json!([{"file":"count-heavy.txt","matches":matches,"matched_lines":lines}])
+                );
+                let rows = result["matches"].as_array().unwrap();
+                assert_eq!(rows.len(), lines);
+                for row in rows {
+                    assert!(row.get("spans").is_none());
+                    assert!(row.get("columns").is_none());
+                }
+            }
+        }
+    }
+    params["query"] = json!({"pattern":"a","glob":["count-heavy.txt"]});
+    let raw = daemon
+        .raw_response(&daemon.request("search", params))
+        .unwrap();
+    assert!(raw.len() > 40 * 1024);
+    let response: Value = serde_json::from_str(&raw).unwrap();
+    assert!(response.get("error").is_none(), "{response}");
+    let result = if daemon.marker["protocol"] == 2 {
+        &response["result"]["data"]
+    } else {
+        &response["result"]
+    };
+    assert_eq!(result["file_stats"], json!([]));
+    assert_eq!(
+        result["matches"][0]["spans"].as_array().unwrap().len(),
+        32 * 1024
+    );
+}
+
+fn assert_multiline_counts(root: &Path, marker: &str) -> u64 {
+    let mut queries = 0;
+    for engine in ["default", "pcre2"] {
+        for (pattern, flags, counts, totals) in [
+            (r"hello\nworld", vec![], "a.txt:1\nb.txt:3\n", (4, 7)),
+            (
+                r"hello\nworld",
+                vec!["-m", "1"],
+                "a.txt:1\nb.txt:2\n",
+                (3, 5),
+            ),
+            (r"hello\nworld", vec!["-m", "0"], "", (0, 0)),
+            (r"hello\nworld", vec!["-o"], "a.txt:1\nb.txt:3\n", (4, 7)),
+            (r"hello\nworld", vec!["-c"], "a.txt:2\nb.txt:5\n", (4, 7)),
+            ("hello|world", vec![], "a.txt:2\nb.txt:6\n", (8, 7)),
+            ("hello|world", vec!["-v"], "b.txt:1\n", (0, 1)),
+        ] {
+            let expected: String = counts
+                .lines()
+                .map(|line| format!("{}/{line}\n", root.to_string_lossy().replace('\\', "/")))
+                .collect();
+            for stats in [false, true] {
+                let mut args = vec![
+                    "-U",
+                    "--engine",
+                    engine,
+                    "--sort",
+                    "path",
+                    "--color",
+                    "never",
+                    "--path-separator",
+                    "/",
+                ];
+                if !flags.contains(&"-c") {
+                    args.push("--count-matches");
+                }
+                args.extend_from_slice(&flags);
+                if stats {
+                    args.push("--stats");
+                }
+                args.extend(["--", pattern, root.to_str().unwrap()]);
+                let output = cli(root, &args);
+                queries += 1;
+                assert_eq!(
+                    output.status.code(),
+                    Some(if counts.is_empty() { 1 } else { 0 })
+                );
+                assert_eq!(
+                    String::from_utf8_lossy(&output.stdout),
+                    expected,
+                    "{marker} {args:?}"
+                );
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if stats {
+                    assert!(stderr.contains(marker), "{stderr}");
+                    assert!(
+                        stderr.contains(&format!(
+                            "{} matches ({} matched lines)",
+                            totals.0, totals.1
+                        )),
+                        "{stderr}"
+                    );
+                    assert!(!stderr.contains("Brute-force"), "{stderr}");
+                    assert!(!stderr.contains("falling back"), "{stderr}");
+                } else {
+                    assert!(stderr.is_empty(), "{stderr}");
+                }
+            }
+        }
+    }
+    queries
 }
 
 #[test]
