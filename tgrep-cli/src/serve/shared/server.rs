@@ -1113,6 +1113,7 @@ fn validate_query(query: &Value, files: bool) -> Result<()> {
             | "type_clear" => value
                 .as_array()
                 .is_some_and(|array| array.iter().all(Value::is_string)),
+            "type_ops" => crate::search::type_ops_from_json(value).is_ok(),
             "max_count" | "after_context" | "before_context" | "max_filesize"
             | "regex_size_limit" | "dfa_size_limit" => value.is_null() || value.is_u64(),
             "case_insensitive"
@@ -1134,6 +1135,9 @@ fn validate_query(query: &Value, files: bool) -> Result<()> {
             | "detail"
             | "positions"
             | "count_matches"
+            | "ordered_filters"
+            | "multiline_replace"
+            | "report_replacements"
             | "stats" => value.is_boolean(),
             _ => false,
         };
@@ -1208,7 +1212,8 @@ impl State {
     fn search(&self, entry: &Entry, query: &Value, files: bool, id: &Value) -> Result<Value> {
         let metadata = json!({
             "root":entry.view.root(), "view":entry.id, "generation":entry.view.generation().key(),
-            "ready":true, "hidden_complete":true, "backend":"shared-v1",
+            "ready":true, "hidden_complete":true, "ordered_filters":true,
+            "multiline_replace":true, "report_replacements":true, "backend":"shared-v1",
             "protocol":PROTOCOL, "instance":self.registration.instance,
             "repository":self.registration.repository
         });
@@ -1299,7 +1304,12 @@ pub(super) fn search_snapshot(
             .into_iter()
             .filter(|path| {
                 scope.relative(path).is_some_and(|relative| {
-                    request.type_filter.matches(relative) && request.glob_filter.matches(relative)
+                    crate::search::passes_filters(
+                        relative,
+                        &request.glob_filter,
+                        &request.type_filter,
+                        request.ordered_filters,
+                    )
                 })
             })
             .collect();

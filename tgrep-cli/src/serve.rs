@@ -810,6 +810,12 @@ struct SearchOpts {
     stats: bool,
     /// Return original per-file totals even when diagnostics are not requested.
     count_matches: bool,
+    /// Render `-U --replace` as ripgrep's multiline printer does. Only sent by
+    /// clients that print text lines and understand block rows.
+    multiline_replace: bool,
+    /// `--json --replace`: report each span's replacement instead of rewriting
+    /// the line.
+    report_replacements: bool,
 }
 
 impl SearchOpts {
@@ -831,6 +837,8 @@ impl SearchOpts {
             stop_on_nonmatch: self.stop_on_nonmatch,
             vimgrep: self.vimgrep,
             all_spans: self.detail || self.stats || self.count_matches,
+            replace_blocks: self.multiline_replace,
+            report_replacements: self.report_replacements,
         }
     }
 }
@@ -1566,6 +1574,9 @@ struct SearchRequest {
     plan: query::QueryPlan,
     glob_filter: crate::glob_filter::GlobFilter,
     type_filter: tgrep_core::filetypes::TypeFilter,
+    /// Whether a positive glob overrides `-t`/`-T`, as in ripgrep. A client
+    /// that predates this does not ask and expects a file to pass both.
+    ordered_filters: bool,
     encoding: tgrep_core::encoding::EncodingMode,
     opts: SearchOpts,
     scope: SearchScope,
@@ -1612,16 +1623,24 @@ fn parse_search_params(params: &serde_json::Value) -> std::result::Result<Search
     let glob_filter =
         crate::glob_filter::GlobFilter::new(&glob_filter_strs, &iglob_strs, glob_case_insensitive)
             .map_err(|e| format!("{e}"))?;
-    // The client sends the raw `-t`/`-T`/`--type-add`/`--type-clear` values and
-    // the server rebuilds the filter with the same shared helper, so both sides
-    // are guaranteed to derive an identical definition table.
-    let type_filter = crate::search::build_type_filter(
-        &str_array("type_add"),
-        &str_array("type_clear"),
-        &str_array("types"),
-        &str_array("types_not"),
-    )
-    .map_err(|e| format!("{e}"))?;
+    // The client sends the type flags as per-kind arrays, plus `type_ops` when
+    // their relative order matters, and the server rebuilds the filter with
+    // the same shared code, so both sides derive an identical definition table.
+    let type_ops = match params.get("type_ops") {
+        Some(ops) => crate::search::type_ops_from_json(ops)?,
+        None => tgrep_core::filetypes::TypeOp::from_unordered(
+            &str_array("type_add"),
+            &str_array("type_clear"),
+            &str_array("types"),
+            &str_array("types_not"),
+        ),
+    };
+    let type_filter =
+        tgrep_core::filetypes::build_type_filter(&type_ops).map_err(|e| format!("{e}"))?;
+    let ordered_filters = params
+        .get("ordered_filters")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let invert_match = params
         .get("invert_match")
         .and_then(|v| v.as_bool())
@@ -1770,6 +1789,7 @@ fn parse_search_params(params: &serde_json::Value) -> std::result::Result<Search
         plan,
         glob_filter,
         type_filter,
+        ordered_filters,
         encoding,
         scope: SearchScope::parse(params)?,
         opts: SearchOpts {
@@ -1797,6 +1817,16 @@ fn parse_search_params(params: &serde_json::Value) -> std::result::Result<Search
                 .get("count_matches")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
+            // Older clients neither send these nor understand the rows they
+            // produce, so absence keeps today's line-by-line rendering.
+            multiline_replace: params
+                .get("multiline_replace")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            report_replacements: params
+                .get("report_replacements")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
         },
     })
 }
@@ -1820,6 +1850,7 @@ fn handle_search(
     let plan = req.plan;
     let glob_filter = req.glob_filter;
     let type_filter = req.type_filter;
+    let ordered_filters = req.ordered_filters;
     let encoding = req.encoding;
     let opts = req.opts;
     let pattern = req.pattern;
@@ -1874,16 +1905,24 @@ fn handle_search(
                 if !visibility.is_visible(&rel_path, &scope.prefix, scope.hidden) {
                     return None;
                 }
-                if !type_filter.matches(scoped) {
-                    type_filtered_count += 1;
-                    return None;
-                }
-                if !glob_filter.is_empty() && !glob_filter.matches(scoped) {
-                    glob_filtered_count += 1;
-                    if first_glob_rejected.is_none() {
-                        first_glob_rejected = Some(rel_path);
+                match glob_filter.decide(scoped) {
+                    crate::glob_filter::GlobDecision::Exclude => {
+                        glob_filtered_count += 1;
+                        if first_glob_rejected.is_none() {
+                            first_glob_rejected = Some(rel_path);
+                        }
+                        return None;
                     }
-                    return None;
+                    crate::glob_filter::GlobDecision::Include if ordered_filters => {}
+                    // A client that predates ordered filters expects a file a
+                    // positive glob included to pass `-t`/`-T` as well.
+                    crate::glob_filter::GlobDecision::Include
+                    | crate::glob_filter::GlobDecision::Unmatched => {
+                        if !type_filter.matches(scoped) {
+                            type_filtered_count += 1;
+                            return None;
+                        }
+                    }
                 }
                 // Match local-index stats: count after path filters, before
                 // size checks or reads can discard candidates.
@@ -2072,6 +2111,11 @@ fn handle_search(
         "num_matches": matches.len(),
         "elapsed_ms": elapsed_ms,
         "hidden_complete": true,
+        // `type_ops` apply in order, and globs override types on request.
+        "ordered_filters": true,
+        // `multiline_replace` and `report_replacements` requests are honoured.
+        "multiline_replace": true,
+        "report_replacements": true,
     });
     if opts.stats || opts.count_matches {
         result["file_stats"] = serde_json::json!(file_stats);
@@ -2318,6 +2362,15 @@ fn collect_match_rows_bounded(
         offset: Option<usize>,
         #[serde(skip_serializing_if = "Option::is_none")]
         term: Option<usize>,
+        /// Source lines of a `-U --replace` block row.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        block: Option<[usize; 2]>,
+        /// A block whose rewrite left nothing to print.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        hidden: bool,
+        /// `--json --replace`: each span's replacement.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        replacements: Option<&'a [String]>,
     }
 
     found.for_each(match_opts, matcher, |emit| -> anyhow::Result<()> {
@@ -2332,6 +2385,9 @@ fn collect_match_rows_bounded(
                 column_shifts,
                 offset_shift,
                 terminator_len,
+                block,
+                hidden,
+                replacements,
             } => {
                 let (columns, offset) = crate::search::to_source_positions(
                     &columns,
@@ -2352,6 +2408,9 @@ fn collect_match_rows_bounded(
                         columns: detail.then_some(&columns),
                         offset: positions.then_some(offset),
                         term: positions.then_some(terminator_len),
+                        block: block.map(|(first, last)| [first, last]),
+                        hidden,
+                        replacements: replacements.as_deref(),
                     },
                     &mut budget,
                 )?;
@@ -2373,6 +2432,9 @@ fn collect_match_rows_bounded(
                         columns: None,
                         offset: positions.then(|| fixups.to_source_offset(absolute_offset)),
                         term: positions.then_some(terminator_len),
+                        block: None,
+                        hidden: false,
+                        replacements: None,
                     },
                     &mut budget,
                 )?;
@@ -14653,6 +14715,61 @@ mod tests {
             assert!(!request.matcher.is_match("malformed").unwrap());
             assert!(request.glob_filter.is_empty());
             assert!(request.type_filter.is_empty());
+        }
+    }
+
+    /// A client that predates ordered filters sends `-t`/`-T` and globs
+    /// without asking for ripgrep's precedence, and expects a file to pass
+    /// both: a positive glob must not reinclude what a type flag excludes.
+    #[test]
+    fn globs_override_types_only_for_clients_that_ask() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let state = test_server_state(&root, &root.join(".tgrep"));
+        state.gitignore_pending.store(false, Ordering::SeqCst);
+        for name in ["a.rs", "a.txt", "a.md"] {
+            let path = root.join(name);
+            std::fs::write(&path, "needle\n").unwrap();
+            let _gate = state.snapshot_gate.read().unwrap();
+            reindex_file(&state, &path, name, false);
+        }
+        let files = |params: &serde_json::Value| {
+            let response = handle_search(None, params, &state);
+            let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+            let mut files: Vec<String> = value["result"]["matches"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{response}"))
+                .iter()
+                .map(|row| row["file"].as_str().unwrap().to_string())
+                .collect();
+            files.sort();
+            files
+        };
+        for (filters, legacy, ordered) in [
+            (
+                serde_json::json!({"types": ["rust"], "glob": ["*.txt"]}),
+                &[][..],
+                &["a.txt"][..],
+            ),
+            (
+                serde_json::json!({"types_not": ["rust"], "glob": ["*.rs", "*.txt"]}),
+                &["a.txt"][..],
+                &["a.rs", "a.txt"][..],
+            ),
+            // Without a positive glob, both orders agree.
+            (
+                serde_json::json!({"types_not": ["rust"], "glob": ["!a.md"]}),
+                &["a.txt"][..],
+                &["a.txt"][..],
+            ),
+        ] {
+            let mut params = filters.clone();
+            params["pattern"] = serde_json::json!("needle");
+            assert_eq!(files(&params), legacy, "{params}");
+            params["ordered_filters"] = serde_json::json!(false);
+            assert_eq!(files(&params), legacy, "{params}");
+            params["ordered_filters"] = serde_json::json!(true);
+            assert_eq!(files(&params), ordered, "{params}");
         }
     }
 

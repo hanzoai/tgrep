@@ -243,10 +243,215 @@ pub fn expand_context_window(
     printed
 }
 
+/// A match's decoded byte range and its expanded `--replace` text.
+type Expansion = (usize, usize, String);
+
+/// One match inside a [`ReplaceBlock`]: where it was in the source, and where
+/// its replacement landed in the rewritten text.
+struct Placed {
+    /// Absolute decoded byte range of the match.
+    src: (usize, usize),
+    /// Byte range of the replacement, relative to the start of the block.
+    dst: (usize, usize),
+}
+
+impl Placed {
+    /// How many bytes the replacement added to, or took from, the text.
+    fn delta(&self) -> isize {
+        (self.dst.1 - self.dst.0) as isize - (self.src.1 - self.src.0) as isize
+    }
+}
+
+/// A run of whole lines that `-U --replace` rewrites as a unit.
+///
+/// ripgrep's multiline printer receives the lines a match covers, extended by
+/// any later match that starts on the line the run ends on or the line right
+/// after it. It replaces every match in that text and then prints the result
+/// line by line, so a replacement can add, remove or join lines, and the
+/// printed line numbers simply count up from the first line of the run.
+struct ReplaceBlock {
+    /// 0-based first and last source lines.
+    first: usize,
+    last: usize,
+    /// Decoded byte offset where the block starts.
+    start: usize,
+    /// The block's lines with every match replaced.
+    text: String,
+    reps: Vec<Placed>,
+}
+
+impl ReplaceBlock {
+    /// Group matches into blocks and rewrite each one.
+    fn build(index: &LineIndex<'_>, content: &str, reps: Vec<Expansion>) -> Vec<ReplaceBlock> {
+        let mut groups: Vec<(usize, usize, Vec<Expansion>)> = Vec::new();
+        for (s, e, text) in reps {
+            let first = index.line_of(s);
+            let last = if e > s { index.line_of(e - 1) } else { first };
+            match groups.last_mut() {
+                Some((_, end, members)) if first <= *end + 1 => {
+                    *end = (*end).max(last);
+                    members.push((s, e, text));
+                }
+                _ => groups.push((first, last, vec![(s, e, text)])),
+            }
+        }
+        groups
+            .into_iter()
+            .map(|(first, last, members)| {
+                let start = index.line_start(first);
+                let end = index.line_start(last + 1);
+                let mut text = String::new();
+                let mut reps = Vec::with_capacity(members.len());
+                let mut pos = start;
+                for (s, e, rep) in members {
+                    text.push_str(&content[pos..s]);
+                    let at = text.len();
+                    text.push_str(&rep);
+                    reps.push(Placed {
+                        src: (s, e),
+                        dst: (at, text.len()),
+                    });
+                    pos = e;
+                }
+                text.push_str(&content[pos..end]);
+                ReplaceBlock {
+                    first,
+                    last,
+                    start,
+                    text,
+                    reps,
+                }
+            })
+            .collect()
+    }
+
+    /// The rewritten lines as `(start, content_end, end)`, stepped the way
+    /// ripgrep's printer does: each line keeps its terminator, a final
+    /// unterminated line only counts if it is not empty, and so an empty
+    /// rewrite has no lines at all.
+    fn lines(&self) -> Vec<(usize, usize, usize)> {
+        let bytes = self.text.as_bytes();
+        let mut out = Vec::new();
+        let mut pos = 0;
+        while pos < bytes.len() {
+            let end = memchr::memchr(b'\n', &bytes[pos..]).map_or(bytes.len(), |i| pos + i + 1);
+            let mut content_end = end;
+            if content_end > pos && bytes[content_end - 1] == b'\n' {
+                content_end -= 1;
+            }
+            if content_end > pos && bytes[content_end - 1] == b'\r' {
+                content_end -= 1;
+            }
+            out.push((pos, content_end, end));
+            pos = end;
+        }
+        out
+    }
+}
+
+/// Maps positions in a [`ReplaceBlock`]'s rewritten text back to decoded
+/// source offsets, for positions visited in increasing order.
+///
+/// Reported offsets have to go back through the decoding repairs, which only
+/// know source offsets. A position inside a replacement maps to the start of
+/// the match it replaced; anything else maps to the source byte it was copied
+/// from.
+struct SourceCursor<'b> {
+    block: &'b ReplaceBlock,
+    next: usize,
+    shift: isize,
+}
+
+impl<'b> SourceCursor<'b> {
+    fn new(block: &'b ReplaceBlock) -> Self {
+        Self {
+            block,
+            next: 0,
+            shift: 0,
+        }
+    }
+
+    fn at(&mut self, pos: usize) -> usize {
+        while let Some(rep) = self.block.reps.get(self.next) {
+            if rep.dst.0 <= pos && pos < rep.dst.1 {
+                return rep.src.0;
+            }
+            if rep.dst.1 > pos {
+                break;
+            }
+            self.shift += rep.delta();
+            self.next += 1;
+        }
+        (self.block.start + pos).saturating_add_signed(-self.shift)
+    }
+}
+
+/// [`group_spans_by_line`] for `--json --replace`, which reports each match's
+/// replacement beside it. Nothing is merged, so every piece keeps its own
+/// replacement: the line a match starts on carries the expansion, and any line
+/// it continues onto carries an empty one.
+fn group_replacements_by_line(
+    index: &LineIndex<'_>,
+    reps: Vec<Expansion>,
+) -> (Vec<LineHit>, Vec<Vec<String>>) {
+    let mut hits: Vec<LineHit> = Vec::new();
+    let mut texts: Vec<Vec<String>> = Vec::new();
+    for (s, e, text) in reps {
+        let first = index.line_of(s);
+        // An empty match sits entirely on its start line.
+        let last = if e > s { index.line_of(e - 1) } else { first };
+        let mut text = Some(text);
+        for li in first..=last.min(index.line_count().saturating_sub(1)) {
+            let ls = index.line_start(li);
+            let le = index.line_end(li);
+            if hits.last().map(|h| h.idx) != Some(li) {
+                hits.push(LineHit {
+                    idx: li,
+                    spans: Vec::new(),
+                });
+                texts.push(Vec::new());
+            }
+            if let (Some(hit), Some(line_texts)) = (hits.last_mut(), texts.last_mut()) {
+                hit.spans.push((s.clamp(ls, le) - ls, e.clamp(ls, le) - ls));
+                line_texts.push(text.take().unwrap_or_default());
+            }
+        }
+    }
+    (hits, texts)
+}
+
+/// The replacement of each of a line's `spans`, for `--json --replace`.
+fn line_replacements(
+    matcher: &SearchMatcher,
+    line: &str,
+    spans: &[(usize, usize)],
+    replacement: &str,
+) -> Result<Vec<String>> {
+    let mut expansions = matcher.expansions(line, replacement)?.into_iter();
+    Ok(spans
+        .iter()
+        .map(|&(s, e)| {
+            expansions
+                .by_ref()
+                .find(|&(es, ee, _)| (es, ee) == (s, e))
+                .map_or_else(String::new, |(_, _, text)| text)
+        })
+        .collect())
+}
+
 /// The compiled pattern. `regex` handles almost everything and is linear-time;
 /// `fancy_regex` is the fallback for backreferences and lookaround.
 pub enum SearchMatcher {
-    Standard(regex::Regex),
+    Standard {
+        re: regex::Regex,
+        /// `--multiline-dotall`, which `re` was compiled with but does not
+        /// expose, and which decides whether `.` can match a line terminator.
+        dotall: bool,
+        /// [`can_match_newline`](Self::can_match_newline), worked out the
+        /// first time it is asked. It depends only on the pattern, so every
+        /// later file, on any thread, reuses it instead of parsing again.
+        newline: std::sync::OnceLock<bool>,
+    },
     /// A backtracking match, optionally gated by a linear-time prefilter.
     ///
     /// `fancy_regex` already delegates to `regex` when a pattern needs nothing
@@ -267,8 +472,17 @@ pub enum SearchMatcher {
 }
 
 impl SearchMatcher {
+    /// The linear-time matcher for `re`, which was compiled with `dotall`.
+    pub fn standard(re: regex::Regex, dotall: bool) -> Self {
+        Self::Standard {
+            re,
+            dotall,
+            newline: std::sync::OnceLock::new(),
+        }
+    }
+
     pub fn is_standard(&self) -> bool {
-        matches!(self, Self::Standard(_))
+        matches!(self, Self::Standard { .. })
     }
 
     /// Whether the prefilter has already ruled this haystack out.
@@ -281,7 +495,7 @@ impl SearchMatcher {
 
     pub fn is_match(&self, hay: &str) -> Result<bool> {
         match self {
-            Self::Standard(re) => Ok(re.is_match(hay)),
+            Self::Standard { re, .. } => Ok(re.is_match(hay)),
             Self::Fancy { re, prefilter } => {
                 if Self::ruled_out(prefilter, hay) {
                     return Ok(false);
@@ -296,7 +510,7 @@ impl SearchMatcher {
     pub fn find_spans(&self, hay: &str) -> Result<Vec<(usize, usize)>> {
         let mut spans: Vec<(usize, usize)> = Vec::new();
         match self {
-            Self::Standard(re) => {
+            Self::Standard { re, .. } => {
                 for m in re.find_iter(hay) {
                     spans.push((m.start(), m.end()));
                 }
@@ -320,7 +534,7 @@ impl SearchMatcher {
     /// that only need to know whether the line matched and where it starts.
     pub fn find_first_span(&self, hay: &str) -> Result<Option<(usize, usize)>> {
         match self {
-            Self::Standard(re) => Ok(re.find(hay).map(|m| (m.start(), m.end()))),
+            Self::Standard { re, .. } => Ok(re.find(hay).map(|m| (m.start(), m.end()))),
             Self::Fancy { re, prefilter } => {
                 if Self::ruled_out(prefilter, hay) {
                     return Ok(None);
@@ -357,11 +571,23 @@ impl SearchMatcher {
     }
 
     /// The expanded replacement for each match, with the match's byte range.
-    fn expansions(&self, hay: &str, replacement: &str) -> Result<Vec<(usize, usize, String)>> {
+    fn expansions(&self, hay: &str, replacement: &str) -> Result<Vec<Expansion>> {
+        self.expansions_upto(hay, replacement, usize::MAX)
+    }
+
+    /// [`expansions`](Self::expansions) for only the first `limit` matches,
+    /// which are the same matches [`find_spans`](Self::find_spans) reports
+    /// first.
+    fn expansions_upto(
+        &self,
+        hay: &str,
+        replacement: &str,
+        limit: usize,
+    ) -> Result<Vec<Expansion>> {
         let mut out = Vec::new();
         match self {
-            Self::Standard(re) => {
-                for caps in re.captures_iter(hay) {
+            Self::Standard { re, .. } => {
+                for caps in re.captures_iter(hay).take(limit) {
                     let m = caps.get(0).expect("group 0 always participates");
                     let mut dst = String::new();
                     caps.expand(replacement, &mut dst);
@@ -372,7 +598,7 @@ impl SearchMatcher {
                 if Self::ruled_out(prefilter, hay) {
                     return Ok(out);
                 }
-                for caps in re.captures_iter(hay) {
+                for caps in re.captures_iter(hay).take(limit) {
                     let caps = caps.map_err(|e| anyhow::anyhow!("regex match error: {e}"))?;
                     let m = caps.get(0).expect("group 0 always participates");
                     let mut dst = String::new();
@@ -382,6 +608,61 @@ impl SearchMatcher {
             }
         }
         Ok(out)
+    }
+
+    /// Whether a match could contain a line terminator.
+    ///
+    /// ripgrep decides this statically from the pattern, not from what it
+    /// actually matched, and only a pattern that can cross lines gets its `-U`
+    /// results printed as blocks. Like ripgrep, line anchors count as able to
+    /// match `\n`. The backtracking engine is never analysed, which ripgrep's
+    /// PCRE2 matcher does not do either, so it always counts.
+    pub fn can_match_newline(&self) -> bool {
+        let Self::Standard {
+            re,
+            dotall,
+            newline,
+        } = self
+        else {
+            return true;
+        };
+        *newline.get_or_init(|| {
+            regex_syntax::ParserBuilder::new()
+                .nest_limit(250)
+                .utf8(false)
+                .multi_line(true)
+                .dot_matches_new_line(*dotall)
+                .build()
+                .parse(re.as_str())
+                .map_or(true, |hir| hir_can_match_newline(&hir))
+        })
+    }
+}
+
+/// Whether any match of `hir` can include `\n`, following the byte analysis
+/// ripgrep runs to choose between line and multiline printing.
+fn hir_can_match_newline(hir: &regex_syntax::hir::Hir) -> bool {
+    use regex_syntax::hir::{Class, HirKind, Look};
+    match hir.kind() {
+        HirKind::Empty => false,
+        HirKind::Literal(lit) => lit.0.contains(&b'\n'),
+        HirKind::Class(Class::Unicode(cls)) => cls
+            .ranges()
+            .iter()
+            .any(|r| r.start() <= '\n' && '\n' <= r.end()),
+        HirKind::Class(Class::Bytes(cls)) => cls
+            .ranges()
+            .iter()
+            .any(|r| r.start() <= b'\n' && b'\n' <= r.end()),
+        HirKind::Look(look) => matches!(
+            look,
+            Look::Start | Look::End | Look::StartLF | Look::EndLF | Look::StartCRLF | Look::EndCRLF
+        ),
+        HirKind::Repetition(rep) => hir_can_match_newline(&rep.sub),
+        HirKind::Capture(cap) => hir_can_match_newline(&cap.sub),
+        HirKind::Concat(subs) | HirKind::Alternation(subs) => {
+            subs.iter().any(hir_can_match_newline)
+        }
     }
 }
 
@@ -449,7 +730,7 @@ pub fn build_search_matcher(patterns: &[String], cfg: &MatcherConfig) -> Result<
 
     let combined = combine_patterns(patterns, cfg, false);
     match build_regex(&combined, cfg) {
-        Ok(re) => Ok(SearchMatcher::Standard(re)),
+        Ok(re) => Ok(SearchMatcher::standard(re, cfg.dotall)),
         // Exceeding `--regex-size-limit`/`--dfa-size-limit` is a resource error,
         // not an unsupported construct. Retrying on the backtracking engine
         // would silently ignore the limit the user asked for.
@@ -700,6 +981,15 @@ pub struct MatchOptions {
     /// search only needs to know the line matched at all. Scanning the rest of
     /// each matching line is pure overhead in that case, so this turns it off.
     pub all_spans: bool,
+    /// Render `-U --replace` the way ripgrep's multiline printer does: rewrite
+    /// every match inside the block of lines it covers, then print the result
+    /// line by line. Only text output prints those blocks; JSON keeps its
+    /// per-line events and counts or file lists never render lines.
+    pub replace_blocks: bool,
+    /// `--json --replace`: keep the source line and spans, and report each
+    /// match's expanded replacement alongside them instead of rewriting the
+    /// line.
+    pub report_replacements: bool,
 }
 
 /// One unit of output produced by searching a single file.
@@ -730,6 +1020,19 @@ pub enum Emit<'a> {
         /// `-M/--max-columns` counts towards the line's length. Zero under `-o`,
         /// where ripgrep measures the matched text on its own.
         terminator_len: usize,
+        /// 1-based first and last source lines of the block a `-U --replace`
+        /// row was rewritten from. The rewritten text can have more or fewer
+        /// lines than the source, so context gaps are measured from these
+        /// rather than from `line_number`.
+        block: Option<(usize, usize)>,
+        /// The block matched, but its replacement left no line to print. The
+        /// row still opens the file's heading and advances the context
+        /// position, as ripgrep does, and keeps the match visible to callers
+        /// that only learn about matches from rows.
+        hidden: bool,
+        /// `--json --replace`: the expanded replacement of each entry in
+        /// `spans`, which then still describe the source text.
+        replacements: Option<Vec<String>>,
     },
     Context {
         line_number: usize,
@@ -745,11 +1048,19 @@ pub struct FileMatches<'a> {
     index: LineIndex<'a>,
     hits: Vec<LineHit>,
     match_totals: (u64, u64),
+    /// `-U --replace` blocks, which replace `hits` when rendering. Empty when
+    /// matches print line by line.
+    blocks: Vec<ReplaceBlock>,
+    /// `--json --replace`: the replacement of every span in `hits`, parallel
+    /// to it. Empty otherwise.
+    replacements: Vec<Vec<String>>,
 }
 
 impl<'a> FileMatches<'a> {
     pub fn find(content: &'a str, matcher: &SearchMatcher, opts: &MatchOptions) -> Result<Self> {
         let index = LineIndex::new(content);
+        let mut blocks = Vec::new();
+        let mut replacements = Vec::new();
         let (hits, match_totals) = if opts.max_count == Some(0) {
             (Vec::new(), (0, 0))
         } else if opts.multiline && !opts.invert_match {
@@ -766,10 +1077,27 @@ impl<'a> FileMatches<'a> {
             let spans = limit_to_line_blocks(&index, &spans, opts.max_count);
             let hits = group_spans_by_line(&index, &spans);
             let totals = (spans.len() as u64, hits.len() as u64);
-            let hits = if opts.vimgrep {
-                group_spans_by_line(&index, &clip_spans_to_start_line(&index, &spans))
-            } else {
-                hits
+            // `captures_iter` finds the same matches as `find_spans`, and
+            // `spans` only ever drops a suffix of them, so the first
+            // `spans.len()` expansions line up with `spans` one for one.
+            let hits = match opts.replace.as_deref() {
+                Some(rep) if opts.report_replacements => {
+                    let reps = matcher.expansions_upto(content, rep, spans.len())?;
+                    let (hits, texts) = group_replacements_by_line(&index, reps);
+                    replacements = texts;
+                    hits
+                }
+                Some(rep)
+                    if opts.replace_blocks && !spans.is_empty() && matcher.can_match_newline() =>
+                {
+                    let reps = matcher.expansions_upto(content, rep, spans.len())?;
+                    blocks = ReplaceBlock::build(&index, content, reps);
+                    hits
+                }
+                _ if opts.vimgrep => {
+                    group_spans_by_line(&index, &clip_spans_to_start_line(&index, &spans))
+                }
+                _ => hits,
             };
             (hits, totals)
         } else {
@@ -778,12 +1106,22 @@ impl<'a> FileMatches<'a> {
                 hits.iter().map(|h| h.spans.len() as u64).sum(),
                 hits.len() as u64,
             );
+            if let Some(rep) = opts.replace.as_deref().filter(|_| opts.report_replacements) {
+                replacements = hits
+                    .iter()
+                    .map(|hit| {
+                        line_replacements(matcher, index.line_text(hit.idx), &hit.spans, rep)
+                    })
+                    .collect::<Result<_>>()?;
+            }
             (hits, totals)
         };
         Ok(Self {
             index,
             hits,
             match_totals,
+            blocks,
+            replacements,
         })
     }
 
@@ -824,11 +1162,39 @@ impl<'a> FileMatches<'a> {
     where
         E: From<anyhow::Error>,
     {
+        if !self.blocks.is_empty() {
+            return self.for_each_block(opts, &mut on_emit);
+        }
+
         let emit_hit = |hit: &LineHit,
                         on_emit: &mut dyn FnMut(Emit<'a>) -> std::result::Result<(), E>|
          -> std::result::Result<(), E> {
             let line = self.index.line_text(hit.idx);
             let offset = self.index.line_start(hit.idx);
+
+            // `--json --replace` describes the source line and reports what
+            // each match would be replaced with, rather than rewriting it.
+            let replacements = self
+                .hits
+                .binary_search_by_key(&hit.idx, |h| h.idx)
+                .ok()
+                .and_then(|i| self.replacements.get(i));
+            if let Some(texts) = replacements.filter(|_| !hit.spans.is_empty()) {
+                return on_emit(Emit::Match {
+                    line_number: hit.idx + 1,
+                    content: Cow::Borrowed(line),
+                    columns: hit.spans.iter().map(|&(s, _)| s + 1).collect(),
+                    spans: hit.spans.clone(),
+                    absolute_offset: offset,
+                    line_offset: offset,
+                    column_shifts: Vec::new(),
+                    offset_shift: 0,
+                    terminator_len: self.index.line_terminator_len(hit.idx),
+                    block: None,
+                    hidden: false,
+                    replacements: Some(texts.clone()),
+                });
+            }
 
             if opts.only_matching && !hit.spans.is_empty() {
                 // With `-r`, `-o` prints the replacement of each match rather
@@ -852,6 +1218,9 @@ impl<'a> FileMatches<'a> {
                             column_shifts: vec![shift],
                             offset_shift: shift,
                             terminator_len: 0,
+                            block: None,
+                            hidden: false,
+                            replacements: None,
                         })?;
                         shift += len as isize - (end - start) as isize;
                     }
@@ -869,6 +1238,9 @@ impl<'a> FileMatches<'a> {
                         column_shifts: Vec::new(),
                         offset_shift: 0,
                         terminator_len: 0,
+                        block: None,
+                        hidden: false,
+                        replacements: None,
                     })?;
                 }
                 return Ok(());
@@ -908,6 +1280,9 @@ impl<'a> FileMatches<'a> {
                 column_shifts,
                 offset_shift: 0,
                 terminator_len: self.index.line_terminator_len(hit.idx),
+                block: None,
+                hidden: false,
+                replacements: None,
             })
         };
 
@@ -960,6 +1335,210 @@ impl<'a> FileMatches<'a> {
         }
         Ok(())
     }
+
+    fn context_line(&self, li: usize) -> Emit<'a> {
+        Emit::Context {
+            line_number: li + 1,
+            content: self.index.line_text(li),
+            absolute_offset: self.index.line_start(li),
+            terminator_len: self.index.line_terminator_len(li),
+        }
+    }
+
+    /// [`for_each`](Self::for_each) for `-U --replace` blocks. Context is
+    /// measured from the source lines each block covers, however many lines
+    /// its rewrite prints.
+    fn for_each_block<E>(
+        &self,
+        opts: &MatchOptions,
+        on_emit: &mut dyn FnMut(Emit<'a>) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        if opts.passthru {
+            let mut li = 0;
+            for block in &self.blocks {
+                while li < block.first {
+                    on_emit(self.context_line(li))?;
+                    li += 1;
+                }
+                emit_block(block, opts, on_emit)?;
+                li = block.last + 1;
+            }
+            while li < self.index.line_count() {
+                on_emit(self.context_line(li))?;
+                li += 1;
+            }
+            return Ok(());
+        }
+
+        if opts.before_context == 0 && opts.after_context == 0 {
+            for block in &self.blocks {
+                emit_block(block, opts, on_emit)?;
+            }
+            return Ok(());
+        }
+
+        let block_lines: Vec<usize> = self.blocks.iter().flat_map(|b| b.first..=b.last).collect();
+        let printed = expand_context_window(
+            &block_lines,
+            self.index.line_count(),
+            opts.before_context,
+            opts.after_context,
+        );
+        let mut blocks = self.blocks.iter().peekable();
+        let mut inside_until = None;
+        for &li in &printed {
+            if inside_until.is_some_and(|last| li <= last) {
+                continue;
+            }
+            if let Some(block) = blocks.next_if(|b| b.first == li) {
+                emit_block(block, opts, on_emit)?;
+                inside_until = Some(block.last);
+            } else {
+                on_emit(self.context_line(li))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The rows ripgrep prints for one `-U --replace` block.
+///
+/// Plain output prints every rewritten line, each with the column of the
+/// block's first replacement. `-o` prints the part of each replacement that
+/// falls on each line, and `--vimgrep` the first line each replacement touches.
+/// Positions come out in the rewritten text, as ripgrep reports them, by way of
+/// a source position plus a shift, which lets the caller still map the source
+/// position back through any decoding repairs.
+fn emit_block<'a, E>(
+    block: &ReplaceBlock,
+    opts: &MatchOptions,
+    on_emit: &mut dyn FnMut(Emit<'a>) -> std::result::Result<(), E>,
+) -> std::result::Result<(), E> {
+    let lines = block.lines();
+    let range = Some((block.first + 1, block.last + 1));
+    // The part of a replacement inside `ls..te`, if any.
+    let piece = |rep: &Placed, ls: usize, te: usize| {
+        let (a, b) = (rep.dst.0.max(ls), rep.dst.1.min(te));
+        (a < b).then_some((a, b))
+    };
+    let mut rows = 0usize;
+
+    if opts.only_matching {
+        let mut shift = 0isize;
+        let shifts: Vec<isize> = block
+            .reps
+            .iter()
+            .map(|rep| {
+                let before = shift;
+                shift += rep.delta();
+                before
+            })
+            .collect();
+        for (k, &(ls, te, _)) in lines.iter().enumerate() {
+            for (rep, &shift) in block.reps.iter().zip(&shifts) {
+                let Some((a, b)) = piece(rep, ls, te) else {
+                    continue;
+                };
+                on_emit(Emit::Match {
+                    line_number: block.first + 1 + k,
+                    content: Cow::Owned(block.text[a..b].to_owned()),
+                    columns: vec![rep.src.0 - block.start + 1],
+                    spans: vec![(0, b - a)],
+                    absolute_offset: rep.src.0,
+                    line_offset: block.start,
+                    column_shifts: vec![shift],
+                    offset_shift: shift,
+                    terminator_len: 0,
+                    block: range,
+                    hidden: false,
+                    replacements: None,
+                })?;
+                rows += 1;
+            }
+        }
+    } else if opts.vimgrep {
+        let mut cursor = SourceCursor::new(block);
+        let mut k = 0;
+        for rep in &block.reps {
+            while lines.get(k).is_some_and(|&(_, _, le)| le <= rep.dst.0) {
+                k += 1;
+            }
+            let Some(&(ls, te, le)) = lines.get(k) else {
+                break;
+            };
+            // An empty replacement right at the start of a line is on no line.
+            if ls >= rep.dst.1 {
+                continue;
+            }
+            let source_line = cursor.at(ls);
+            let column = rep.src.0.saturating_sub(source_line);
+            on_emit(Emit::Match {
+                line_number: block.first + 1 + k,
+                content: Cow::Owned(block.text[ls..te].to_owned()),
+                columns: vec![column + 1],
+                spans: piece(rep, ls, te)
+                    .map(|(a, b)| (a - ls, b - ls))
+                    .into_iter()
+                    .collect(),
+                absolute_offset: source_line,
+                line_offset: source_line,
+                column_shifts: vec![(rep.dst.0 - ls) as isize - column as isize],
+                offset_shift: (block.start + ls) as isize - source_line as isize,
+                terminator_len: le - te,
+                block: range,
+                hidden: false,
+                replacements: None,
+            })?;
+            rows += 1;
+        }
+    } else {
+        let mut cursor = SourceCursor::new(block);
+        let column = block
+            .reps
+            .first()
+            .map_or(1, |rep| rep.src.0 - block.start + 1);
+        for (k, &(ls, te, le)) in lines.iter().enumerate() {
+            let source_line = cursor.at(ls);
+            on_emit(Emit::Match {
+                line_number: block.first + 1 + k,
+                content: Cow::Owned(block.text[ls..te].to_owned()),
+                columns: vec![column],
+                spans: block
+                    .reps
+                    .iter()
+                    .filter_map(|rep| piece(rep, ls, te))
+                    .map(|(a, b)| (a - ls, b - ls))
+                    .collect(),
+                absolute_offset: source_line,
+                line_offset: block.start,
+                column_shifts: Vec::new(),
+                offset_shift: (block.start + ls) as isize - source_line as isize,
+                terminator_len: le - te,
+                block: range,
+                hidden: false,
+                replacements: None,
+            })?;
+            rows += 1;
+        }
+    }
+
+    if rows == 0 {
+        on_emit(Emit::Match {
+            line_number: block.first + 1,
+            content: Cow::Borrowed(""),
+            columns: Vec::new(),
+            spans: Vec::new(),
+            absolute_offset: block.start,
+            line_offset: block.start,
+            column_shifts: Vec::new(),
+            offset_shift: 0,
+            terminator_len: 0,
+            block: range,
+            hidden: true,
+            replacements: None,
+        })?;
+    }
+    Ok(())
 }
 
 /// Whether `pattern` is free of anchors whose meaning depends on where the
@@ -1011,9 +1590,15 @@ fn pattern_is_anchor_free(pattern: &str) -> bool {
 /// match *spans* is a candidate, not just the line it starts on: `find_iter`
 /// yields leftmost non-overlapping matches, so a match beginning on an earlier
 /// line can be the one that covers this line's match, and a pattern that can
-/// cross `\n` (via `\s`, a negated class, or `-s`) can span several. Under those
-/// rules every line that really matches is covered, and the per-line matcher
-/// still has the final say, so extra candidates cost time and never accuracy.
+/// cross `\n` (via `\s`, a negated class, or `-s`) can span several.
+///
+/// A match covers the lines from its start offset through its end offset. A
+/// zero-length match, like those of `\b` and `\<`, covers only the line it sits
+/// on. A match ending just past a `\n` also covers the next line: `find_iter`
+/// never yields an empty match where the previous match ended, so it may have
+/// hidden one at that line's start (`\<` in `\s|\<`). Under those rules every
+/// line that really matches is covered, and the per-line matcher still has the
+/// final say, so extra candidates cost time and never accuracy.
 fn candidate_lines<'a>(
     content: &'a str,
     index: &'a LineIndex<'a>,
@@ -1025,27 +1610,25 @@ fn candidate_lines<'a>(
     if opts.stop_on_nonmatch {
         return None;
     }
-    let SearchMatcher::Standard(re) = matcher else {
+    let SearchMatcher::Standard { re, .. } = matcher else {
         return None;
     };
     if !pattern_is_anchor_free(re.as_str()) {
         return None;
     }
     // A pattern that matches the empty string matches at every offset, so the
-    // prescan would yield every line and the real loop is cheaper.
+    // prescan would yield every line and the real loop is cheaper. Patterns
+    // like `\b` still match empty at some offsets; the spans below allow that.
     if re.is_match("") {
         return None;
     }
 
+    // Each match starts at or after the previous one's end, so lines arrive in
+    // non-decreasing order and dropping repeats leaves them strictly ascending.
     let mut last: Option<usize> = None;
     Some(
         re.find_iter(content)
-            .flat_map(move |m| {
-                let first = index.line_of(m.start());
-                // Matches are non-empty here, so `end - 1` is inside the match.
-                let last_line = index.line_of(m.end() - 1);
-                first..=last_line
-            })
+            .flat_map(move |m| index.line_of(m.start())..=index.line_of(m.end()))
             .filter(move |&li| {
                 let fresh = last != Some(li);
                 if fresh {
@@ -1216,7 +1799,7 @@ mod tests {
 
     #[test]
     fn stats_keep_original_multiline_matches_and_physical_lines() {
-        let matcher = SearchMatcher::Standard(regex::Regex::new(r"hello\nworld").unwrap());
+        let matcher = SearchMatcher::standard(regex::Regex::new(r"hello\nworld").unwrap(), false);
         for vimgrep in [false, true] {
             let found = FileMatches::find(
                 "hello\nworld\n",
@@ -1237,7 +1820,7 @@ mod tests {
 
     #[test]
     fn multiline_empty_matches_do_not_create_a_phantom_trailing_line() {
-        let matcher = SearchMatcher::Standard(regex::Regex::new("").unwrap());
+        let matcher = SearchMatcher::standard(regex::Regex::new("").unwrap(), false);
         for (content, matches, lines) in [("", 0, 0), ("\n", 1, 1), ("aa\n", 3, 1), ("aa", 3, 1)] {
             for max_count in [None, Some(1)] {
                 let found = FileMatches::find(
@@ -1304,6 +1887,14 @@ mod tests {
             "(?i)ABC",
             r"\d+",
             "xyz",
+            r"\b",
+            r"\<",
+            r"\>",
+            r"\b{start}",
+            r"\b{end}",
+            r"\s|\<",
+            r"\W|\<",
+            r"\b|zzz",
         ];
         let haystacks = [
             "",
@@ -1320,11 +1911,14 @@ mod tests {
             "12\n34a\n\n56\n",
             "no matches at all\nnothing here\n",
             "a\n\n\na\n",
+            "x\nbbb",
+            "!!\nbbb\n",
+            " aaa\nbbb\n",
         ];
 
         for pat in patterns {
             let re = regex::Regex::new(pat).expect("test pattern compiles");
-            let matcher = SearchMatcher::Standard(re);
+            let matcher = SearchMatcher::standard(re, false);
             for hay in haystacks {
                 let index = LineIndex::new(hay);
                 let opts = MatchOptions::default();
@@ -1370,7 +1964,7 @@ mod tests {
     #[test]
     fn prescan_respects_max_count_and_stop_on_nonmatch() {
         let hay = "hit\nhit\nmiss\nhit\n";
-        let matcher = SearchMatcher::Standard(regex::Regex::new("hit").unwrap());
+        let matcher = SearchMatcher::standard(regex::Regex::new("hit").unwrap(), false);
         let index = LineIndex::new(hay);
 
         let opts = MatchOptions {
@@ -1397,7 +1991,7 @@ mod tests {
         // propose every line at the cost of an extra pass.
         let hay = "a\nb\n";
         let index = LineIndex::new(hay);
-        let matcher = SearchMatcher::Standard(regex::Regex::new("x*").unwrap());
+        let matcher = SearchMatcher::standard(regex::Regex::new("x*").unwrap(), false);
         let opts = MatchOptions::default();
         assert!(candidate_lines(hay, &index, &matcher, &opts).is_none());
     }
@@ -1408,13 +2002,39 @@ mod tests {
         // both have to be offered.
         let hay = "a \n b\nzzz\n";
         let index = LineIndex::new(hay);
-        let matcher = SearchMatcher::Standard(regex::Regex::new(r"\s+").unwrap());
+        let matcher = SearchMatcher::standard(regex::Regex::new(r"\s+").unwrap(), false);
         let opts = MatchOptions::default();
         let proposed: Vec<usize> = candidate_lines(hay, &index, &matcher, &opts)
             .expect("anchor-free and non-empty")
             .collect();
         assert!(proposed.contains(&0));
         assert!(proposed.contains(&1));
+    }
+
+    #[test]
+    fn prescan_covers_zero_length_matches() {
+        // `\b` and `\<` match empty at a word's edge but never match `""` on
+        // their own, so they take the prescan. An empty match at offset 0 has
+        // no byte before its end, and one at a later line's start has that byte
+        // on the previous line. `find_iter` also skips the empty `\<` match
+        // right after the `\n` that `\s` matched in `\s|\<`, so only where that
+        // `\n` match ends puts line 1 forward.
+        let opts = MatchOptions::default();
+        for (pattern, hay, want) in [
+            (r"\b", "aaa\nbbb\n", &[0, 1][..]),
+            (r"\<", "!!\nbbb\n", &[1][..]),
+            (r"\s|\<", "x\nbbb", &[0, 1][..]),
+        ] {
+            let index = LineIndex::new(hay);
+            let matcher = SearchMatcher::standard(regex::Regex::new(pattern).unwrap(), false);
+            assert!(
+                candidate_lines(hay, &index, &matcher, &opts).is_some(),
+                "{pattern:?} should take the prescan"
+            );
+            let hits = collect_hits(hay, &index, &matcher, &opts).unwrap();
+            let got: Vec<usize> = hits.iter().map(|h| h.idx).collect();
+            assert_eq!(got, want, "{pattern:?} on {hay:?}");
+        }
     }
 
     //
@@ -1793,5 +2413,249 @@ mod tests {
                 spans: vec![(0, 1), (1, 2)]
             }]
         );
+    }
+
+    /// The rows a `-U` search emits, in the shape of `rg -n --column`: a match
+    /// is `line:column:text`, a context line `line-text`, and a block whose
+    /// rewrite printed nothing `line:hidden`.
+    fn multiline_rows(
+        content: &str,
+        pattern: &str,
+        replace: &str,
+        tweak: impl FnOnce(&mut MatchOptions),
+    ) -> Vec<String> {
+        let matcher = build_search_matcher(
+            &[pattern.to_string()],
+            &MatcherConfig {
+                multiline: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut opts = MatchOptions {
+            multiline: true,
+            replace: Some(replace.to_string()),
+            replace_blocks: true,
+            all_spans: true,
+            ..Default::default()
+        };
+        tweak(&mut opts);
+        let found = FileMatches::find(content, &matcher, &opts).unwrap();
+        let mut rows = Vec::new();
+        found
+            .for_each(&opts, &matcher, |emit| -> Result<()> {
+                rows.push(match emit {
+                    Emit::Match {
+                        hidden: true,
+                        line_number,
+                        ..
+                    } => format!("{line_number}:hidden"),
+                    Emit::Match {
+                        line_number,
+                        content,
+                        columns,
+                        column_shifts,
+                        ..
+                    } => {
+                        let column =
+                            columns[0] as isize + column_shifts.first().copied().unwrap_or(0);
+                        format!("{line_number}:{column}:{content}")
+                    }
+                    Emit::Context {
+                        line_number,
+                        content,
+                        ..
+                    } => format!("{line_number}-{content}"),
+                });
+                Ok(())
+            })
+            .unwrap();
+        rows
+    }
+
+    #[test]
+    fn newline_capability_follows_the_pattern_not_the_match() {
+        for (pattern, dotall, expected) in [
+            (r"hello\nworld", false, true),
+            (r"l\s?", false, true),
+            (r"[^a]", false, true),
+            ("$", false, true),
+            ("^foo", false, true),
+            (r"(foo)+\n?", false, true),
+            ("l.", false, false),
+            ("l.", true, true),
+            (r"\bfoo\b", false, false),
+            ("foo|bar", false, false),
+        ] {
+            let matcher = build_search_matcher(
+                &[pattern.to_string()],
+                &MatcherConfig {
+                    multiline: true,
+                    dotall,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            // Worked out once, on first use, from the `dotall` the pattern was
+            // compiled with.
+            let SearchMatcher::Standard { newline, .. } = &matcher else {
+                panic!("{pattern:?} should use the linear-time engine");
+            };
+            assert_eq!(newline.get(), None, "{pattern:?} dotall={dotall}");
+            for _ in 0..2 {
+                assert_eq!(
+                    matcher.can_match_newline(),
+                    expected,
+                    "{pattern:?} dotall={dotall}"
+                );
+            }
+            assert_eq!(
+                newline.get(),
+                Some(&expected),
+                "{pattern:?} dotall={dotall}"
+            );
+        }
+        // Lookaround is never analysed, so it always counts.
+        let fancy = build_search_matcher(
+            &["l(?=o)".to_string()],
+            &MatcherConfig {
+                multiline: true,
+                engine: RegexEngine::Pcre2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(fancy.can_match_newline());
+    }
+
+    #[test]
+    fn multiline_replace_rewrites_whole_blocks() {
+        // Expected rows are ripgrep 15's.
+        let two = "hello\nworld\nhello\nworld\n";
+        assert_eq!(
+            multiline_rows("hello\nworld\n", r"hello\nworld", "X", |_| {}),
+            ["1:1:X"]
+        );
+        // Matches on adjacent lines share one block.
+        assert_eq!(
+            multiline_rows(two, r"hello\nworld", "X", |_| {}),
+            ["1:1:X", "2:1:X"]
+        );
+        assert_eq!(
+            multiline_rows(two, r"hello\nworld", "X", |o| o.max_count = Some(1)),
+            ["1:1:X"]
+        );
+        assert_eq!(
+            multiline_rows("hello\nworld\n", r"(hello)\n(world)", "${2}/${1}", |o| {
+                o.only_matching = true
+            }),
+            ["1:1:world/hello"]
+        );
+        let mid = "hello world\nfoo hello\nworld bar\n";
+        assert_eq!(
+            multiline_rows(mid, r"(o\nw)", "<$1>", |_| {}),
+            ["2:9:foo hell<o", "3:9:w>orld bar"]
+        );
+        assert_eq!(
+            multiline_rows(mid, r"(o\nw)", "<$1>", |o| o.only_matching = true),
+            ["2:9:<o", "3:9:w>"]
+        );
+        assert_eq!(
+            multiline_rows(mid, r"(o\nw)", "<$1>", |o| o.vimgrep = true),
+            ["2:9:foo hell<o"]
+        );
+        // A pattern that cannot match a line terminator keeps line-by-line
+        // rows, each with its own column.
+        assert_eq!(
+            multiline_rows(mid, "l.", "X", |_| {}),
+            ["1:3:heXo worX", "2:7:foo heXo", "3:4:worX bar"]
+        );
+    }
+
+    #[test]
+    fn multiline_replace_reports_positions_in_the_rewritten_text() {
+        // Expected rows are ripgrep 15's.
+        let content = "hello\nworld\n";
+        assert_eq!(
+            multiline_rows(content, r"l\s?", "A\nB", |_| {}),
+            ["1:3:heA", "2:3:BA", "3:3:Bo", "4:3:worA", "5:3:Bd"]
+        );
+        assert_eq!(
+            multiline_rows(content, r"l\s?", "A\nB", |o| o.only_matching = true),
+            ["1:3:A", "2:3:B", "2:6:A", "3:6:B", "4:14:A", "5:14:B"]
+        );
+        assert_eq!(
+            multiline_rows(content, r"l\s?", "A\nB", |o| o.vimgrep = true),
+            ["1:3:heA", "2:2:BA", "4:4:worA"]
+        );
+    }
+
+    #[test]
+    fn multiline_replace_measures_context_from_source_blocks() {
+        // Expected rows are ripgrep 15's, which prints a `--` between the
+        // second and third rows of the last case.
+        let content = "x\nhello\nworld\ny\nz\nhello\nworld\n";
+        let rows = ["1-x", "2:1:X", "4-y", "5-z", "6:1:X"];
+        let around = |o: &mut MatchOptions| {
+            o.before_context = 1;
+            o.after_context = 1;
+        };
+        assert_eq!(multiline_rows(content, r"hello\nworld", "X", around), rows);
+        assert_eq!(
+            multiline_rows(content, r"hello\nworld", "X", |o| o.passthru = true),
+            rows
+        );
+        // A block whose rewrite is empty still occupies its source lines.
+        assert_eq!(
+            multiline_rows(content, r"hello\nworld\n", "", |o| o.after_context = 1),
+            ["2:hidden", "4-y", "6:hidden"]
+        );
+    }
+
+    #[test]
+    fn json_replace_reports_source_text_beside_each_replacement() {
+        let matcher = SearchMatcher::standard(regex::Regex::new("(l+)|(o)").unwrap(), false);
+        for multiline in [false, true] {
+            let opts = MatchOptions {
+                multiline,
+                replace: Some("<$1>".into()),
+                report_replacements: true,
+                all_spans: true,
+                ..Default::default()
+            };
+            let found = FileMatches::find("hello\nfoo\n", &matcher, &opts).unwrap();
+            let mut rows = Vec::new();
+            found
+                .for_each(&opts, &matcher, |emit| -> Result<()> {
+                    let Emit::Match {
+                        content,
+                        spans,
+                        replacements,
+                        ..
+                    } = emit
+                    else {
+                        panic!("no context requested");
+                    };
+                    rows.push((content.into_owned(), spans, replacements));
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(
+                rows,
+                [
+                    (
+                        "hello".to_string(),
+                        vec![(2, 4), (4, 5)],
+                        Some(vec!["<ll>".to_string(), "<>".to_string()])
+                    ),
+                    (
+                        "foo".to_string(),
+                        vec![(1, 2), (2, 3)],
+                        Some(vec!["<>".to_string(), "<>".to_string()])
+                    ),
+                ],
+                "multiline={multiline}"
+            );
+        }
     }
 }
