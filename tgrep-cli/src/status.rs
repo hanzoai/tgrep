@@ -44,6 +44,10 @@ pub fn run(root: &Path, index_path: Option<&Path>) -> Result<()> {
             "  Hidden coverage: {}",
             coverage_label(status.hidden_complete.unwrap_or(false))
         );
+        #[cfg(feature = "docs")]
+        if let Some(documents) = &status.documents {
+            println!("  Documents:  {}", documents_line(documents));
+        }
         return Ok(());
     }
 
@@ -114,6 +118,37 @@ struct StatusResult {
     #[serde(default)]
     index_total: u64,
     hidden_complete: Option<bool>,
+    #[cfg(feature = "docs")]
+    #[serde(default)]
+    documents: Option<serde_json::Value>,
+}
+
+/// One line for a server's document report: extraction counts by outcome, and
+/// the cache's entries and bytes.
+#[cfg(feature = "docs")]
+fn documents_line(report: &serde_json::Value) -> String {
+    let counts = |key: &str| -> String {
+        report[key]
+            .as_object()
+            .map(|counts| {
+                counts
+                    .iter()
+                    .map(|(reason, count)| format!("{count} {reason}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .filter(|counts| !counts.is_empty())
+            .unwrap_or_else(|| "none".to_string())
+    };
+    format!(
+        "{} extracted, {} cached; not indexed: {}; members skipped: {}; cache {} entries, {} bytes",
+        report["extracted"],
+        report["cached"],
+        counts("failed"),
+        counts("members_skipped"),
+        report["cache"]["entries"],
+        report["cache"]["bytes"],
+    )
 }
 
 fn coverage_label(complete: bool) -> &'static str {

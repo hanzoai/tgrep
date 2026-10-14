@@ -1430,9 +1430,13 @@ of text, 30 s. Members whose names leave the archive (`..`, absolute paths) and
 link members are refused. A document an adapter cannot read is indexed by name
 only. Results are cached in `.tgrep/docs/`, keyed by a BLAKE3 hash of the bytes,
 the adapter and the adapter version: an unchanged document is extracted once,
-a changed one again, and `tgrep index` drops entries no indexed document uses.
-`tgrep index` reports how many documents it extracted, read from the cache, or
-could not read, and which members it skipped and why.
+a changed one again (a failure is remembered too, except running out of time).
+The cache holds at most 2 GiB, evicting what was read least recently, and
+`tgrep index` drops entries no indexed document uses. `tgrep serve` re-extracts
+a document when the watcher reports it changed and drops it when it is deleted
+or renamed, like any file. `tgrep index` and `tgrep status` report how many
+documents were extracted, read from the cache, or could not be read, which
+members were skipped and why, and the cache's size.
 
 Shared-worktree (`serve --shared`) indexes do not extract documents.
 

@@ -500,3 +500,88 @@ fn office_hits_name_the_paragraph_slide_and_cell() {
         serde_json::json!({"path": "office/book.xlsx", "sheet": "Q2!x", "cell": "A1"})
     );
 }
+
+/// Retry `check` until it holds or 30 seconds pass.
+fn eventually(what: &str, mut check: impl FnMut() -> bool) {
+    let started = Instant::now();
+    while !check() {
+        assert!(started.elapsed() < Duration::from_secs(30), "{what}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+#[test]
+fn a_server_reextracts_changed_documents_and_drops_removed_ones() {
+    let (temp, root, _) = repo();
+    office(&root);
+    let _server = serve(&root, &[]);
+    let hit = |pattern: &str| run(&root, &["-n", "--", pattern]);
+
+    fs::write(
+        root.join("docs/app.log.gz"),
+        fixture::gzip(b"rotated needle\n"),
+    )
+    .unwrap();
+    eventually("a changed gzip is re-read", || {
+        hit("rotated needle").stdout == "docs/app.log.gz:1:rotated needle\n"
+    });
+    assert_eq!(hit("needle in gz").code, 1);
+
+    fs::write(
+        root.join("office/memo.docx"),
+        fixture::docx(&["Memo title", "revised memo text"]),
+    )
+    .unwrap();
+    eventually("a changed docx is re-extracted", || {
+        hit("revised memo").stdout == "office/memo.docx#para=2:1:revised memo text\n"
+    });
+    assert_eq!(hit("first needle paragraph").code, 1);
+
+    fs::remove_file(root.join("docs/report.pdf")).unwrap();
+    eventually("a deleted pdf leaves no hit", || {
+        hit("revenue grew").code == 1
+    });
+
+    fs::rename(root.join("docs/bundle.zip"), root.join("docs/moved.zip")).unwrap();
+    eventually("a renamed zip is found under its new name only", || {
+        hit("call the bank").stdout == "docs/moved.zip!notes/todo.txt:1:call the bank\n"
+    });
+
+    let status = run(&root, &["status", "."]);
+    assert!(
+        status.stdout.contains("  Documents:  ") && status.stdout.contains("extracted"),
+        "{}",
+        status.stdout
+    );
+    drop(temp);
+}
+
+/// Set the uncompressed size a zip's local and central headers declare for
+/// its first member.
+fn declare_size(zip: &mut [u8], size: u32) {
+    zip[22..26].copy_from_slice(&size.to_le_bytes());
+    let central = (0..zip.len() - 4)
+        .find(|&at| zip[at..at + 4] == 0x0201_4b50u32.to_le_bytes())
+        .unwrap();
+    zip[central + 24..central + 28].copy_from_slice(&size.to_le_bytes());
+}
+
+#[test]
+fn a_member_declaring_more_than_the_bound_is_skipped_unread() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("repo");
+    fs::create_dir_all(root.join(".git")).unwrap();
+    let mut bomb = fixture::zip(&[("big.txt", b"needle tiny"), ("ok.txt", b"needle ok\n")]);
+    declare_size(&mut bomb, 200 << 20);
+    fs::write(root.join("bomb.zip"), bomb).unwrap();
+    let built = index(&root);
+    assert!(
+        built.stderr.contains("members skipped: 1 large"),
+        "{}",
+        built.stderr
+    );
+    assert_eq!(
+        run(&root, &["-n", "--", "needle"]).stdout,
+        "bomb.zip!ok.txt:1:needle ok\n"
+    );
+}

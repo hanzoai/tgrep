@@ -53,8 +53,10 @@
 //!
 //! Extraction is memoized on disk by a hash of the document's bytes, its adapter
 //! and [`VERSION`] ([`Cache`]): an unchanged document is extracted once, a changed
-//! one is extracted again, and a failure is remembered as such. A cache never
-//! changes a result, only how long it takes.
+//! one is extracted again, and a failure is remembered as such, except running
+//! out of time, which a later read retries. A cache is bounded by bytes and
+//! evicts what was read least recently; it never changes a result, only how
+//! long it takes.
 //!
 //! # Limits
 //!
@@ -729,6 +731,7 @@ pub fn load_with(cache: Option<&Cache>, name: &str, bytes: &[u8]) -> Result<Arc<
         }
     }
     if let Some(cache) = cache
+        && !matches!(result, Err(Reason::Time))
         && let Err(error) = cache.put(&key, &result)
     {
         eprintln!("warning: cannot cache extracted text of {name}: {error}");
@@ -793,6 +796,21 @@ impl Stats {
             "members_skipped": skips(&self.members),
         })
     }
+}
+
+/// [`stats`] and the installed cache's size, as JSON for a status report.
+pub fn report() -> serde_json::Value {
+    let mut report = stats().json();
+    if let Some(cache) = installed()
+        && let Ok((entries, bytes)) = cache.usage()
+    {
+        report["cache"] = serde_json::json!({
+            "dir": cache.dir(),
+            "entries": entries,
+            "bytes": bytes,
+        });
+    }
+    report
 }
 
 pub fn stats() -> Stats {

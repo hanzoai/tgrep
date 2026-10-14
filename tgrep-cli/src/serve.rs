@@ -2519,6 +2519,12 @@ fn handle_status(id: Option<serde_json::Value>, state: &ServerState) -> String {
         "index_progress": state.index_progress.load(std::sync::atomic::Ordering::Relaxed),
         "index_total": state.index_total.load(std::sync::atomic::Ordering::Relaxed),
     });
+    #[cfg(feature = "docs")]
+    let result = {
+        let mut result = result;
+        result["documents"] = tgrep_core::docs::report();
+        result
+    };
 
     json_rpc_result(id, result)
 }
