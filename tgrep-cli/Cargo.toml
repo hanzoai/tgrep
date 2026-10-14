@@ -13,6 +13,7 @@ readme = "../README.md"
 
 [features]
 managed-test-hooks = ["tgrep-core/managed-test-hooks"]
+docs = ["tgrep-core/docs"]
 
 [[bin]]
 name = "tgrep"

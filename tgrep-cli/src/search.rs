@@ -192,6 +192,8 @@ impl SortMode {
             .transpose()?;
         entries.sort_by_cached_key(|entry| {
             let rel = relative_path(entry);
+            #[cfg(feature = "docs")]
+            let rel = tgrep_core::docs::split(rel).0;
             let time = rooted.as_ref().and_then(|rooted| {
                 match rooted
                     .open_file(&scope.indexed_path(rel))
@@ -918,6 +920,13 @@ pub fn run(
     let index_dir = index_path
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| builder::default_index_dir(&root));
+    #[cfg(feature = "docs")]
+    tgrep_core::docs::install(
+        index_dir
+            .is_dir()
+            .then(|| tgrep_core::docs::Cache::open(&index_dir.join(crate::index::DOCS_DIR)).ok())
+            .flatten(),
+    );
 
     let ci = opts.effective_case_insensitive()?;
     // ripgrep rejects an invalid `--type-add` before searching, even one that
@@ -1385,6 +1394,14 @@ fn render_server_result(
     } else if opts.files_only {
         let mut seen = std::collections::HashSet::new();
         for m in matches {
+            #[cfg(feature = "docs")]
+            let m = &{
+                let mut m = m.clone();
+                if let Some(file) = m.get("file").and_then(|f| f.as_str()) {
+                    m["file"] = tgrep_core::docs::split(file).0.into();
+                }
+                m
+            };
             if let Some(file) = m.get("file").and_then(|f| f.as_str())
                 && seen.insert(file.to_string())
             {
@@ -1679,6 +1696,30 @@ fn search_local_index(
     let explicit = matches!(scope, IndexScope::File(_));
 
     for (_, rel_path) in &candidates {
+        #[cfg(feature = "docs")]
+        if !opts.text && tgrep_core::docs::handles(Path::new(rel_path)) {
+            let doc = (|| {
+                let file = rooted.open_file(Path::new(rel_path))?;
+                read_doc(file, rel_path, read_size_limit(opts, explicit))
+            })();
+            match doc {
+                Ok(Some(doc)) => {
+                    if search_doc(&doc, &matcher, rel_path, opts, writer, explicit)? {
+                        had_matches = true;
+                        if opts.quiet {
+                            break;
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    if !opts.no_messages {
+                        eprintln!("warning: cannot read indexed file {rel_path:?}: {error}");
+                    }
+                }
+            }
+            continue;
+        }
         let read = (|| -> std::io::Result<Option<FileRead>> {
             let file = rooted.open_file(Path::new(rel_path))?;
             read_open_text_lossy(file, opts.encoding, read_size_limit(opts, explicit))
@@ -1797,6 +1838,8 @@ fn resolve_scope(index_dir: &Path, root: &Path) -> Option<(PathBuf, IndexScope)>
 /// The walker applies this while descending; the indexed paths never went
 /// through it, so it has to be re-applied by counting components.
 fn within_max_depth(rel: &str, opts: &SearchOptions) -> bool {
+    #[cfg(feature = "docs")]
+    let rel = tgrep_core::docs::split(rel).0;
     match opts.max_depth {
         // `rel` is search-root-relative, so its separator count is the number
         // of directory levels below the root; a depth of 1 means "directly in
@@ -1831,7 +1874,23 @@ fn brute_force_search(
 
     if root.is_file() {
         let rel_path = explicit_file_display_path(root);
-        if passes_filters(&rel_path, &glob_filter, &type_filter, true)
+        #[cfg(feature = "docs")]
+        let document = !opts.text && tgrep_core::docs::handles(root);
+        #[cfg(not(feature = "docs"))]
+        let document = false;
+        #[cfg(feature = "docs")]
+        if document
+            && passes_filters(&rel_path, &glob_filter, &type_filter, true)
+            && let Some(doc) = read_doc(
+                std::fs::File::open(root)?,
+                &rel_path,
+                read_size_limit(opts, true),
+            )?
+        {
+            had_matches = search_doc(&doc, &matcher, &rel_path, opts, writer, true)?;
+        }
+        if !document
+            && passes_filters(&rel_path, &glob_filter, &type_filter, true)
             && let Some(read) = read_text_lossy(root, opts.encoding, read_size_limit(opts, true))?
         {
             had_matches = search_file(&read, &matcher, &rel_path, opts, writer, true)?;
@@ -1874,6 +1933,29 @@ fn brute_force_search(
             .replace('\\', "/");
 
         if !passes_filters(&rel_path, &glob_filter, &type_filter, true) {
+            continue;
+        }
+
+        #[cfg(feature = "docs")]
+        if !opts.text && tgrep_core::docs::handles(path) {
+            let doc = std::fs::File::open(path)
+                .and_then(|file| read_doc(file, &rel_path, opts.max_filesize));
+            match doc {
+                Ok(Some(doc)) => {
+                    if search_doc(&doc, &matcher, &rel_path, opts, writer, false)? {
+                        had_matches = true;
+                        if opts.quiet {
+                            break;
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    if !opts.no_messages {
+                        eprintln!("warning: cannot read file {}: {error}", path.display());
+                    }
+                }
+            }
             continue;
         }
 
@@ -1939,12 +2021,17 @@ enum FileText {
     Owned(String),
     /// Mapped bytes verified as UTF-8 when the map was created.
     Mapped(memmap2::Mmap),
+    /// One part of a document's extracted text.
+    #[cfg(feature = "docs")]
+    Part(std::sync::Arc<tgrep_core::docs::Doc>, usize),
 }
 
 impl FileText {
     fn as_str(&self) -> &str {
         match self {
             Self::Owned(text) => text,
+            #[cfg(feature = "docs")]
+            Self::Part(doc, part) => doc.part_text(&doc.parts[*part]),
             // SAFETY: `Mapped` is only constructed by `try_map_text`, which
             // validates the entire mapping with `str::from_utf8` first, so the
             // bytes were UTF-8 when the map was taken. A concurrent writer
@@ -2222,6 +2309,67 @@ fn search_file(
         }
         FileOutcome::NoMatch | FileOutcome::Skipped => Ok(false),
     }
+}
+
+/// Read a document and its extracted text. `None` when it exceeds `limit` or
+/// no adapter can read it: like a binary file, it has no text to search.
+#[cfg(feature = "docs")]
+fn read_doc(
+    mut file: std::fs::File,
+    name: &str,
+    limit: Option<u64>,
+) -> std::io::Result<Option<std::sync::Arc<tgrep_core::docs::Doc>>> {
+    let length = file.metadata()?.len();
+    if limit.is_some_and(|limit| length > limit) {
+        return Ok(None);
+    }
+    let Some(bytes) = read_bytes_with_limit(&mut file, limit, length.min(1 << 26) as usize)? else {
+        return Ok(None);
+    };
+    Ok(tgrep_core::docs::load(name, &bytes).ok())
+}
+
+/// Search a document part by part. Each part is searched as a file of its own
+/// named `rel_path` joined with its location, so line numbers, context and
+/// counts stay inside the part. `-l`, `-L` and `-q` judge the document as one
+/// file and print its path once.
+#[cfg(feature = "docs")]
+fn search_doc(
+    doc: &std::sync::Arc<tgrep_core::docs::Doc>,
+    matcher: &SearchMatcher,
+    rel_path: &str,
+    opts: &SearchOptions,
+    writer: &mut OutputWriter,
+    explicit: bool,
+) -> Result<bool> {
+    if opts.quiet || opts.files_only || opts.files_without_match {
+        let match_opts = opts.match_options();
+        let mut any = false;
+        for part in &doc.parts {
+            let found =
+                crate::matching::FileMatches::find(doc.part_text(part), matcher, &match_opts)?;
+            if !found.is_empty() {
+                any = true;
+                break;
+            }
+        }
+        let selected = any != opts.files_without_match;
+        if selected && !opts.quiet {
+            writer.write_file(rel_path)?;
+        }
+        return Ok(selected);
+    }
+    let mut any = false;
+    for (i, part) in doc.parts.iter().enumerate() {
+        let read = FileRead {
+            text: FileText::Part(std::sync::Arc::clone(doc), i),
+            fixups: tgrep_core::encoding::LossyFixups::default(),
+            first_nul: None,
+        };
+        let file = tgrep_core::docs::join(rel_path, &part.loc);
+        any |= search_file(&read, matcher, &file, opts, writer, explicit)?;
+    }
+    Ok(any)
 }
 
 /// Search one file's decoded text, mapping reported offsets back to the bytes

@@ -185,6 +185,10 @@ impl Default for WalkOptions {
 /// walk rejected here must not be inserted into the index by an incremental
 /// update, or the two disagree about what the index contains.
 pub fn is_binary_extension(path: &Path) -> bool {
+    #[cfg(feature = "docs")]
+    if crate::docs::handles(path) {
+        return false;
+    }
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|ext| {

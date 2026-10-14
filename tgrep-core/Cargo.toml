@@ -12,6 +12,7 @@ categories = ["text-processing", "algorithms"]
 
 [features]
 managed-test-hooks = []
+docs = ["dep:flate2", "dep:lopdf", "dep:quick-xml", "dep:tar", "dep:zip"]
 
 [dependencies]
 serde = { workspace = true }
@@ -31,6 +32,11 @@ tempfile = "3"
 same-file = "1"
 rusqlite = { workspace = true }
 getrandom = "0.4.2"
+flate2 = { version = "1.1", optional = true }
+lopdf = { version = "0.45", default-features = false, optional = true }
+quick-xml = { version = "0.42", optional = true }
+tar = { version = "0.4.46", default-features = false, optional = true }
+zip = { version = "9", default-features = false, features = ["deflate-flate2"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 cap-std = "4"

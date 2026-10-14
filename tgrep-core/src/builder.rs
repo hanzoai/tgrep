@@ -699,6 +699,9 @@ impl std::ops::Deref for IndexRead {
 }
 
 fn extract_indexed_file(path: String, data: &IndexRead) -> ExtractedFile {
+    #[cfg(feature = "docs")]
+    let text = crate::docs::index_text(&path, data);
+    #[cfg(not(feature = "docs"))]
     let text = crate::encoding::decode_for_index(data);
     let (trigrams, content_id) = if trigram::is_binary(&text) {
         (None, None)

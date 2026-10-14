@@ -1,6 +1,8 @@
 #![deny(unnameable_test_items)]
 
 pub mod builder;
+#[cfg(feature = "docs")]
+pub mod docs;
 pub mod encoding;
 pub mod error;
 pub(crate) mod external;

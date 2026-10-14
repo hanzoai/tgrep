@@ -391,6 +391,9 @@ impl LiveIndex {
         let full_path = root.join(rel_path);
         match std::fs::read(&full_path) {
             Ok(data) => {
+                #[cfg(feature = "docs")]
+                let text = crate::docs::index_text(rel_path, &data);
+                #[cfg(not(feature = "docs"))]
                 let text = crate::encoding::decode_for_index(&data);
                 if trigram::is_binary(&text) {
                     self.delete_file(rel_path);

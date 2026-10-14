@@ -21,6 +21,49 @@ fn buffer_bytes_from_mb(mb: u64) -> Result<usize> {
         })
 }
 
+/// Where an index directory keeps its document extraction cache.
+#[cfg(feature = "docs")]
+pub const DOCS_DIR: &str = "docs";
+
+/// Drop cache entries no indexed document uses and print what extraction did.
+#[cfg(feature = "docs")]
+fn report_documents() -> Result<()> {
+    let stats = tgrep_core::docs::stats();
+    let cache = tgrep_core::docs::installed().context("document cache is not installed")?;
+    let swept = cache.sweep()?;
+    let (entries, bytes) = cache.usage()?;
+    let failed: Vec<String> = stats
+        .failed
+        .iter()
+        .map(|(reason, count)| format!("{count} {reason}"))
+        .collect();
+    let skipped: Vec<String> = stats
+        .members
+        .iter()
+        .map(|(reason, count)| format!("{count} {reason}"))
+        .collect();
+    eprintln!(
+        "Documents: {} extracted, {} cached, {} not indexed{}; members skipped: {}; cache {} entries, {} bytes ({} removed)",
+        stats.extracted,
+        stats.cached,
+        stats.failed.total(),
+        if failed.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", failed.join(", "))
+        },
+        if skipped.is_empty() {
+            "none".to_string()
+        } else {
+            skipped.join(", ")
+        },
+        entries,
+        bytes,
+        swept
+    );
+    Ok(())
+}
+
 /// Everything `tgrep index` needs to build an index.
 ///
 /// A struct rather than a long parameter list: the arguments are all plain
@@ -71,6 +114,10 @@ pub fn run(opts: RunOptions<'_>) -> Result<()> {
         .map(Path::to_path_buf)
         .unwrap_or_else(|| builder::default_index_dir(&root));
     let (index_dir, _lock_file) = crate::serve::prepare_index_directory(&root, &index_dir)?;
+    #[cfg(feature = "docs")]
+    tgrep_core::docs::install(Some(tgrep_core::docs::Cache::open(
+        &index_dir.join(DOCS_DIR),
+    )?));
     // Dropped after the build so the sampled peak (on platforms without a
     // kernel high-water mark) covers the whole of it.
     let sampler = mem::PrivatePeakSampler::start();
@@ -90,6 +137,8 @@ pub fn run(opts: RunOptions<'_>) -> Result<()> {
     )?;
     let elapsed = started.elapsed();
     drop(sampler);
+    #[cfg(feature = "docs")]
+    report_documents()?;
 
     let strategy_label = match strategy {
         IndexStrategy::InMemory => "memory",

@@ -1366,6 +1366,65 @@ Remove-Item -LiteralPath $download -Recurse
 
 Ensure `$HOME/.local/bin` (Unix) or `$HOME\.cargo\bin` (Windows) is on `PATH`.
 
+## Hanzo additions
+
+This is Hanzo's fork of [microsoft/tgrep](https://github.com/microsoft/tgrep),
+based on v1.2.1 (`c7b2ab827274f8a56ff95eadc005f69e0732ee92`). `main` stays equal
+to upstream; additions live on branches and behind cargo features that are off
+by default, so a build without them is upstream's. Upstream's MIT license and
+attribution are unchanged.
+
+### Documents (`--features docs`)
+
+```bash
+cargo build --release --features docs
+tgrep index . && tgrep -n -- "quarterly revenue" .
+```
+
+PDF, zip, tar, tar.gz/tgz and gz files are read by in-process adapters. Their
+extracted text goes into the same trigram index as source files, so a query over
+documents costs what a query over code costs, and the server, the on-disk index
+and `--no-index` all search the same text.
+
+| Extension | Unit of a hit |
+|---|---|
+| `.pdf` | page: `#page=N` |
+| `.zip`, `.tar`, `.tar.gz`, `.tgz` | member: `!path/in/archive` (members are adapted by their own names, so archives nest) |
+| `.gz` | the decompressed stream, adapted by the name without `.gz` |
+
+Every hit is one line:
+
+```text
+PATH[!MEMBER]...[#UNIT]:LINE:TEXT
+
+docs/report.pdf#page=2:14:quarterly revenue
+docs/bundle.zip!notes/todo.txt:3:call the bank
+logs.tar.gz!deep.zip!deep.txt:2:deep needle
+```
+
+`MEMBER` is a path inside its archive, outermost first; `UNIT` is `page=N`
+(1-based, the PDF open-parameters form). In member names `%`, `!`, `#`, `:` and
+control characters are written `%XX`. `LINE` counts from the start of the page
+or member. `--json` events carry the same location as an object,
+`"location": {"path": "docs/report.pdf", "members": [...], "page": 2}`. Each part
+is searched as a file of its own, so `-n`, `-c`, `-C` and `--vimgrep` stay inside
+it; `-l`, `--files-without-match` and `-q` judge the document as one file and
+print its path once. `-a` searches a document's raw bytes instead. Exit codes are
+ripgrep's: 0 match, 1 none, 2 error.
+
+Extraction runs in memory, never writes a member to disk, and is bounded per
+document: 4 nested containers, 64 MiB per member (a member declaring more is
+skipped unread), 512 MiB decompressed in all, 65,536 members per archive, 64 MiB
+of text, 30 s. Members whose names leave the archive (`..`, absolute paths) and
+link members are refused. A document an adapter cannot read is indexed by name
+only. Results are cached in `.tgrep/docs/`, keyed by a BLAKE3 hash of the bytes,
+the adapter and the adapter version: an unchanged document is extracted once,
+a changed one again, and `tgrep index` drops entries no indexed document uses.
+`tgrep index` reports how many documents it extracted, read from the cache, or
+could not read, and which members it skipped and why.
+
+Shared-worktree (`serve --shared`) indexes do not extract documents.
+
 ## Contributing
 
 This project welcomes contributions and suggestions.  Most contributions require you to agree to a

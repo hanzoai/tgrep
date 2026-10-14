@@ -888,6 +888,10 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
     // Exclude both other servers and standalone index builds.
     // The lock file is held for the lifetime of the server and released on exit.
     let (index_dir, _lock_file) = prepare_index_directory(&root, &index_dir)?;
+    #[cfg(feature = "docs")]
+    tgrep_core::docs::install(Some(tgrep_core::docs::Cache::open(
+        &index_dir.join(crate::index::DOCS_DIR),
+    )?));
 
     let has_index = index_dir.join("lookup.bin").exists();
     let mut needs_build = !has_index;
@@ -1992,6 +1996,19 @@ fn handle_search(
             }
         }
     };
+    // A document is searched part by part, each part a file of its own named
+    // by its location. Its text comes from the extraction cache by content
+    // hash, so the content cache, keyed by path, never holds it.
+    #[cfg(feature = "docs")]
+    let order: std::collections::HashMap<String, usize> = candidate_info
+        .iter()
+        .enumerate()
+        .map(|(position, (rel_path, _))| (rel_path.clone(), position))
+        .collect();
+    #[cfg(feature = "docs")]
+    let (candidate_info, documents): (Vec<_>, Vec<_>) = candidate_info
+        .into_iter()
+        .partition(|(rel_path, _)| !tgrep_core::docs::handles(Path::new(rel_path)));
     let candidate_contents: Vec<(String, Arc<DecodedFile>)> = if encoding.may_differ_from_index() {
         // The cache holds text decoded with the default (BOM-sniffing) rules and
         // is shared by every client. A request that asked for a different
@@ -2063,6 +2080,30 @@ fn handle_search(
                     .map(|c| (rel_path.clone(), c))
             })
             .collect()
+    };
+    #[cfg(feature = "docs")]
+    let candidate_contents = {
+        let mut contents = candidate_contents;
+        for (rel_path, full_path) in &documents {
+            let Some(bytes) = read_candidate(full_path) else {
+                continue;
+            };
+            let Ok(doc) = tgrep_core::docs::load(rel_path, &bytes) else {
+                continue;
+            };
+            for part in &doc.parts {
+                contents.push((
+                    tgrep_core::docs::join(rel_path, &part.loc),
+                    Arc::new(DecodedFile {
+                        text: doc.part_text(part).to_string(),
+                        fixups: tgrep_core::encoding::LossyFixups::default(),
+                        source_bytes: bytes.len() as u64,
+                    }),
+                ));
+            }
+        }
+        contents.sort_by_key(|(file, _)| order.get(tgrep_core::docs::split(file).0).copied());
+        contents
     };
     let resolve_ms = t_resolve.elapsed().as_secs_f64() * 1000.0;
 
@@ -5520,6 +5561,9 @@ fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bo
         run_stale_refresh_hook(state, StaleRefreshPhase::AfterConcreteRead);
         verified
     };
+    #[cfg(feature = "docs")]
+    let text = tgrep_core::docs::index_text(rel_path, &data);
+    #[cfg(not(feature = "docs"))]
     let text = tgrep_core::encoding::decode_for_index(&data);
     let is_binary = tgrep_core::trigram::is_binary(&text);
     let content_id = (!is_binary).then(|| tgrep_core::meta::ContentId::from_indexed_bytes(&text));
@@ -7549,12 +7593,15 @@ fn background_index_build_in_pool(state: &Arc<ServerState>, root: &Path, index_d
                             return None;
                         }
                     };
-                    let data = tgrep_core::encoding::decode_for_index(&data);
                     let rel_path = path
                         .strip_prefix(root)
                         .unwrap_or(path)
                         .to_string_lossy()
                         .replace('\\', "/");
+                    #[cfg(feature = "docs")]
+                    let data = tgrep_core::docs::index_text(&rel_path, &data);
+                    #[cfg(not(feature = "docs"))]
+                    let data = tgrep_core::encoding::decode_for_index(&data);
 
                     let content = if tgrep_core::trigram::is_binary(&data) {
                         None

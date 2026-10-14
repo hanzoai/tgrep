@@ -398,6 +398,8 @@ impl OutputWriter {
             "type": "begin",
             "data": { "path": { "text": self.display_path(file) } },
         });
+        #[cfg(feature = "docs")]
+        let msg = self.located(msg, file);
         let line = format!("{msg}\n");
         self.file_stats.searches = 1;
         self.file_stats.bytes_searched = self.pending_bytes_searched;
@@ -432,6 +434,8 @@ impl OutputWriter {
                 "stats": self.file_stats.to_json(self.file_started.elapsed()),
             },
         });
+        #[cfg(feature = "docs")]
+        let msg = self.located(msg, &file);
         let line = format!("{msg}\n");
         self.file_stats.bytes_printed += line.len() as u64;
         self.stdout.write_all(line.as_bytes())?;
@@ -497,6 +501,10 @@ impl OutputWriter {
     /// the argument survives verbatim — `rg foo ./src` prints `./src\lib.rs` on
     /// Windows — while everything appended to it uses the platform separator.
     fn display_path(&self, file: &str) -> String {
+        #[cfg(feature = "docs")]
+        if let (file, Some(location)) = tgrep_core::docs::split(file) {
+            return self.display_path(file) + location;
+        }
         let joined = match &self.config.path_display {
             PathDisplay::Exact(p) => p.clone(),
             PathDisplay::Prefix(p) => format!("{p}{}", native_separators(file)),
@@ -506,6 +514,20 @@ impl OutputWriter {
             Some(sep) => joined.replace(['/', '\\'], sep),
             None => joined,
         }
+    }
+
+    /// Add `location` to a JSON message's `data` for a document part: the
+    /// file's displayed path and the part's members and unit.
+    #[cfg(feature = "docs")]
+    fn located(&self, mut msg: serde_json::Value, file: &str) -> serde_json::Value {
+        if let (path, Some(location)) = tgrep_core::docs::split(file)
+            && let Some(loc) = tgrep_core::docs::Loc::parse(location)
+        {
+            let mut location = loc.json();
+            location["path"] = self.display_path(path).into();
+            msg["data"]["location"] = location;
+        }
+        msg
     }
 
     /// Apply `-M/--max-columns`, replacing an over-long line with a note.
@@ -596,6 +618,8 @@ impl OutputWriter {
                     "submatches": [],
                 },
             });
+            #[cfg(feature = "docs")]
+            let msg = self.located(msg, &ctx.file);
             let line = format!("{msg}\n");
             self.file_stats.bytes_printed += line.len() as u64;
             self.stdout.write_all(line.as_bytes())?;
@@ -715,6 +739,8 @@ impl OutputWriter {
                         "submatches": submatches,
                     },
                 });
+                #[cfg(feature = "docs")]
+                let msg = self.located(msg, &m.file);
                 let line = format!("{msg}\n");
                 self.file_stats.bytes_printed += line.len() as u64;
                 self.stdout.write_all(line.as_bytes())?;

@@ -1631,8 +1631,18 @@ fn run_search(
     // shown unless exactly one file was named, and line numbers only when
     // writing to a terminal.
     let targets = normalize_search_paths(paths);
+    // A named document is searched as one file per part, each named by its
+    // location, so its name stays on every line.
+    #[cfg(feature = "docs")]
+    let document = targets.len() == 1 && !opts.text && tgrep_core::docs::handles(&targets[0].path);
+    #[cfg(not(feature = "docs"))]
+    let document = false;
     opts.no_filename = cli.no_filename
-        || (!cli.with_filename && !cli.vimgrep && targets.len() == 1 && targets[0].path.is_file());
+        || (!cli.with_filename
+            && !cli.vimgrep
+            && !document
+            && targets.len() == 1
+            && targets[0].path.is_file());
 
     // One writer for the whole invocation: ripgrep emits a single JSON
     // `summary` covering every path it was given, so per-path writers would
