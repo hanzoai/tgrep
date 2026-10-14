@@ -95,6 +95,21 @@ after Git is gone; collection requires explicit authorization and current
 versions. Never delete a cache directory as a substitute for managed collection.
 Legacy/unmanaged v1 storage remains retain-all.
 
+Managed attachments use bounded parallel verified-read batches without raising
+namespace operation-worker limits. Inspect `last_reconcile.timings` and its
+read/reuse/resource counters to distinguish queueing, discovery, verification,
+catalog/control and checkpoint work. Healthy native managed views have no
+periodic safety rescan: silently missed notifications can leave results stale
+indefinitely, even while ready. This is an accepted staleness tradeoff, not
+proof of change coverage. `views.refresh` explicitly verifies all admitted
+contents; use `--no-index` when current disk bytes are required.
+`--watch-mode poll` and actual native-watcher failure/budget fallback still
+perform full verification after `--poll-interval` seconds (default 120).
+`reconciliation_policy` distinguishes configured mode from each view's effective
+polling and reports namespace monitor counts. First attachment/restore and
+reported watcher errors/rescans retain full verification. A clean Git status
+never replaces those reads, even for another worktree at the same commit.
+
 Moving an existing v1 integration to managed v2 requires this client lifecycle,
 not just a startup flag. Detach all v1 leases and drain in-flight operations
 before stopping v1, then establish new managed ownership and tokens.

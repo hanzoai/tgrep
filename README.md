@@ -266,7 +266,7 @@ Automatic refresh has two modes, configured on `tgrep serve`:
 | Flag | Default | Effect |
 |------|---------|--------|
 | `--watch-mode <auto\|poll>` | `auto` | Prefer native notifications with polling fallback, or use polling only |
-| `--poll-interval <SECONDS>` | `120` | Wait after each polling reconciliation completes; range 1-86400 |
+| `--poll-interval <SECONDS>` | `120` | Wait after each polling reconciliation completes; range 1-86400; does not schedule healthy native managed views |
 | `--watch-budget <N>` | `8192` | Conservative process-local native watch ceiling; range 1-4294967295 |
 | `--no-watch` | off | Disable all automatic refresh: native watching, polling, and periodic reconciliation |
 
@@ -286,7 +286,8 @@ finishes; scan time and ongoing builds/saves add to the delay. Queries do not
 defer polling. Queue overflows and native rescan notifications also request
 reconciliation; read-only access events are discarded.
 
-Native mode reconciles about once an hour to recover missed notifications.
+Ordinary (non-shared) native mode reconciles about once an hour to recover missed
+notifications.
 It waits for a two-minute gap in queries, deferring no longer than four hours.
 `--poll-interval` does not change this native safety cadence.
 
@@ -856,8 +857,8 @@ options, `--no-ignore` variants, `--text`, `--binary`, `--follow`,
 `--one-file-system`, `--ignore-file`, passthru, files-without-match and zero-count
 output scan with a diagnostic rather than claiming incompatible coverage.
 
-**Freshness:** native notifications close readiness as they arrive; bounded
-hints are an optimization, not proof that all events arrived. Every automatic
+**Legacy v1 freshness:** native notifications close readiness as they arrive;
+bounded hints are an optimization, not proof that all events arrived. Every automatic
 mode also fully reconciles after `--poll-interval` seconds (default 120, measured
 after completion). Native registration failures/budget exhaustion fall back to
 polling. `--watch-mode poll` skips native registration; `--no-watch` disables both
@@ -949,6 +950,36 @@ policy above, establish fresh ownership and tokens, and attach the intended
 exact revision through the managed lifecycle. Enabling v2 does not convert
 existing v1 stores or authorize their collection; legacy storage remains
 retain-all.
+
+Managed reconciliation verifies files in bounded parallel batches, with shared
+namespace-wide CPU, input-byte and parent-handle admission.
+Namespace operation-worker limits do not need to be raised. Exact checkout bytes,
+identity checks, cancellation and final readiness gates are preserved; clean Git
+status never replaces first-attachment verification. Receipts and status expose
+[phase timings and resource counters](SHARED_WORKTREE_INDEXES.md#bounded-managed-reconciliation).
+Ancestor-ID comparisons detect observed substitutions, but are not lifetime
+pins: IDs may be reused after batch handles close. Reconciliation retains its
+per-read containment and publication-epoch checks, not an atomic filesystem
+snapshot or uninterrupted ancestor-lifetime guarantee.
+A [same-binary Windows/ReFS measurement](SHARED_INDEX_BENCHMARKS.md#large-checkout-reconciliation-rc2)
+completed a fresh warm-base attachment in 186.144 seconds versus 542.469 seconds
+for a standalone full build (2.914x), while still reading every required file.
+That result is one ordered pair without a file-cache flush, not a universal speedup.
+Healthy native managed views do **not** run the former 120-second periodic
+safety rescan. Watcher notifications still invalidate and reconcile views, but
+silently missed changes can leave results stale indefinitely, even while ready.
+This deliberately accepts staleness, not proven change coverage; timestamps,
+clean Git status and an unavailable journal do not prove that nothing changed.
+Initial attachment/restore, explicit `views.refresh`, and reported watcher
+errors/rescans retain verified repair. Use `--no-index` for current disk bytes.
+
+Explicit `--watch-mode poll` and actual native-watcher failure/budget fallback
+still perform full reconciliation after `--poll-interval` seconds (default 120)
+following completion. `--no-watch` disables watching and polling, not initial
+verification or explicit refresh. `reconciliation_policy` distinguishes these
+per-view modes and namespace monitor counts. This recurring-mode change is
+subsequent to the immutable benchmark source, not a measured idle-work saving.
+Legacy v1 and ordinary-server refresh policies are unchanged.
 
 `views.advance` prepares and reconciles a complete replacement while unrelated
 ready views continue serving. The current exact commit, physical generation,
@@ -1138,8 +1169,10 @@ publishing buffered results, reenter `with_snapshot` and reject a changed epoch.
 Later reads through that handle remain caller-owned: report read errors and call
 `invalidate_all()` after leaving the guard rather than publishing partial results.
 Do not reenter the view from its closure. A refresh acknowledges processed hints,
-**not an atomic filesystem snapshot**. Periodic full reconciliation remains necessary; no-watch
-callers must explicitly refresh, and final reads can race subsequent edits.
+**not an atomic filesystem snapshot**. For verification independent of
+notifications, use explicit or polling full repair: healthy native managed views
+no longer promise eventual periodic repair, and no-watch callers must explicitly
+refresh. Final reads can race subsequent edits.
 
 Full verification reads, auto-decodes and hashes checkout bytes; clean Git
 status, blob identity and index stat data are never byte-equivalence proofs.
