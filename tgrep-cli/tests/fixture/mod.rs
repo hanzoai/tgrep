@@ -182,3 +182,249 @@ pub fn gzip(data: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&(data.len() as u32).to_le_bytes());
     out
 }
+
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+const XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#;
+const W: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+const P: &str = "http://schemas.openxmlformats.org/presentationml/2006/main";
+const A: &str = "http://schemas.openxmlformats.org/drawingml/2006/main";
+const R: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+const S: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+const REL: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
+
+fn relationships(targets: &[(String, String)]) -> String {
+    let mut xml = format!(r#"{XML}<Relationships xmlns="{REL}">"#);
+    for (id, target) in targets {
+        xml.push_str(&format!(
+            r#"<Relationship Id="{id}" Type="{R}/x" Target="{target}"/>"#
+        ));
+    }
+    xml.push_str("</Relationships>");
+    xml
+}
+
+/// A docx whose body holds `paragraphs`; `""` is an empty paragraph, a tab
+/// is `w:tab` and a newline `w:br`.
+pub fn docx(paragraphs: &[&str]) -> Vec<u8> {
+    let mut body = String::new();
+    for paragraph in paragraphs {
+        if paragraph.is_empty() {
+            body.push_str("<w:p/>");
+            continue;
+        }
+        body.push_str("<w:p><w:r>");
+        for (i, line) in paragraph.split('\n').enumerate() {
+            if i > 0 {
+                body.push_str("<w:br/>");
+            }
+            for (j, piece) in line.split('\t').enumerate() {
+                if j > 0 {
+                    body.push_str("<w:tab/>");
+                }
+                body.push_str(&format!(
+                    r#"<w:t xml:space="preserve">{}</w:t>"#,
+                    xml_escape(piece)
+                ));
+            }
+        }
+        body.push_str("</w:r></w:p>");
+    }
+    let document =
+        format!(r#"{XML}<w:document xmlns:w="{W}"><w:body>{body}</w:body></w:document>"#);
+    zip(&[
+        ("[Content_Types].xml", b"<Types/>"),
+        ("word/document.xml", document.as_bytes()),
+    ])
+}
+
+/// A pptx of `slides`, each a list of paragraphs. Slide files are numbered
+/// in reverse, so only the presentation's own list gives the order.
+pub fn pptx(slides: &[&[&str]]) -> Vec<u8> {
+    let count = slides.len();
+    let mut ids = String::new();
+    let mut targets = Vec::new();
+    let mut files: Vec<(String, String)> = Vec::new();
+    for (i, paragraphs) in slides.iter().enumerate() {
+        let file = count - i;
+        ids.push_str(&format!(
+            r#"<p:sldId id="{}" r:id="rId{}"/>"#,
+            256 + i,
+            i + 2
+        ));
+        targets.push((format!("rId{}", i + 2), format!("slides/slide{file}.xml")));
+        let mut body = String::new();
+        for paragraph in *paragraphs {
+            body.push_str(&format!(
+                "<a:p><a:r><a:t>{}</a:t></a:r></a:p>",
+                xml_escape(paragraph)
+            ));
+        }
+        files.push((
+            format!("ppt/slides/slide{file}.xml"),
+            format!(
+                r#"{XML}<p:sld xmlns:p="{P}" xmlns:a="{A}"><p:cSld><p:spTree><p:sp><p:txBody>{body}</p:txBody></p:sp></p:spTree></p:cSld></p:sld>"#
+            ),
+        ));
+    }
+    let presentation = format!(
+        r#"{XML}<p:presentation xmlns:p="{P}" xmlns:r="{R}"><p:sldIdLst>{ids}</p:sldIdLst></p:presentation>"#
+    );
+    files.push(("ppt/presentation.xml".into(), presentation));
+    files.push((
+        "ppt/_rels/presentation.xml.rels".into(),
+        relationships(&targets),
+    ));
+    let entries: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(name, xml)| (name.as_str(), xml.as_bytes()))
+        .collect();
+    zip(&entries)
+}
+
+/// An xlsx of `sheets`, each a name and its `(reference, value)` cells. A
+/// value that parses as a number is a number cell; anything else a shared
+/// string.
+pub fn xlsx(sheets: &[(&str, &[(&str, &str)])]) -> Vec<u8> {
+    let mut strings: Vec<String> = Vec::new();
+    let mut files: Vec<(String, String)> = Vec::new();
+    let mut entries = String::new();
+    let mut targets = Vec::new();
+    for (i, (name, cells)) in sheets.iter().enumerate() {
+        entries.push_str(&format!(
+            r#"<sheet name="{}" sheetId="{}" r:id="rId{}"/>"#,
+            xml_escape(name),
+            i + 1,
+            i + 1
+        ));
+        targets.push((
+            format!("rId{}", i + 1),
+            format!("worksheets/sheet{}.xml", i + 1),
+        ));
+        let mut rows: std::collections::BTreeMap<u32, String> = std::collections::BTreeMap::new();
+        for (reference, value) in *cells {
+            let row: u32 = reference
+                .trim_start_matches(|c: char| c.is_ascii_alphabetic())
+                .parse()
+                .unwrap();
+            let cell = if value.parse::<f64>().is_ok() {
+                format!(r#"<c r="{reference}"><v>{value}</v></c>"#)
+            } else {
+                strings.push(value.to_string());
+                format!(
+                    r#"<c r="{reference}" t="s"><v>{}</v></c>"#,
+                    strings.len() - 1
+                )
+            };
+            rows.entry(row).or_default().push_str(&cell);
+        }
+        let data: String = rows
+            .iter()
+            .map(|(row, cells)| format!(r#"<row r="{row}">{cells}</row>"#))
+            .collect();
+        files.push((
+            format!("xl/worksheets/sheet{}.xml", i + 1),
+            format!(r#"{XML}<worksheet xmlns="{S}"><sheetData>{data}</sheetData></worksheet>"#),
+        ));
+    }
+    let shared: String = strings
+        .iter()
+        .map(|s| format!("<si><t>{}</t></si>", xml_escape(s)))
+        .collect();
+    files.push((
+        "xl/workbook.xml".into(),
+        format!(
+            r#"{XML}<workbook xmlns="{S}" xmlns:r="{R}"><sheets>{entries}</sheets></workbook>"#
+        ),
+    ));
+    files.push(("xl/_rels/workbook.xml.rels".into(), relationships(&targets)));
+    files.push((
+        "xl/sharedStrings.xml".into(),
+        format!(r#"{XML}<sst xmlns="{S}">{shared}</sst>"#),
+    ));
+    let entries: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(name, xml)| (name.as_str(), xml.as_bytes()))
+        .collect();
+    zip(&entries)
+}
+
+const ODF: &str = r#"xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0" xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0" xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0""#;
+
+fn odf(mimetype: &str, body: &str) -> Vec<u8> {
+    let content = format!(
+        r#"{XML}<office:document-content {ODF}><office:body>{body}</office:body></office:document-content>"#
+    );
+    zip(&[
+        ("mimetype", mimetype.as_bytes()),
+        ("content.xml", content.as_bytes()),
+    ])
+}
+
+/// An odt whose first paragraph is a heading.
+pub fn odt(paragraphs: &[&str]) -> Vec<u8> {
+    let mut body = String::new();
+    for (i, paragraph) in paragraphs.iter().enumerate() {
+        let tag = if i == 0 { "text:h" } else { "text:p" };
+        body.push_str(&format!("<{tag}>{}</{tag}>", xml_escape(paragraph)));
+    }
+    odf(
+        "application/vnd.oasis.opendocument.text",
+        &format!("<office:text>{body}</office:text>"),
+    )
+}
+
+/// An ods of `sheets`, each a name and its rows of cell texts; `""` is an
+/// empty cell.
+pub fn ods(sheets: &[(&str, &[&[&str]])]) -> Vec<u8> {
+    let mut body = String::new();
+    for (name, rows) in sheets {
+        body.push_str(&format!(
+            r#"<table:table table:name="{}">"#,
+            xml_escape(name)
+        ));
+        for row in *rows {
+            body.push_str("<table:table-row>");
+            for cell in *row {
+                if cell.is_empty() {
+                    body.push_str("<table:table-cell/>");
+                } else {
+                    body.push_str(&format!(
+                        r#"<table:table-cell office:value-type="string"><text:p>{}</text:p></table:table-cell>"#,
+                        xml_escape(cell)
+                    ));
+                }
+            }
+            body.push_str("</table:table-row>");
+        }
+        body.push_str("</table:table>");
+    }
+    odf(
+        "application/vnd.oasis.opendocument.spreadsheet",
+        &format!("<office:spreadsheet>{body}</office:spreadsheet>"),
+    )
+}
+
+/// An odp of `slides`, each a list of paragraphs.
+pub fn odp(slides: &[&[&str]]) -> Vec<u8> {
+    let mut body = String::new();
+    for (i, paragraphs) in slides.iter().enumerate() {
+        body.push_str(&format!(
+            r#"<draw:page draw:name="p{}"><draw:frame><draw:text-box>"#,
+            i + 1
+        ));
+        for paragraph in *paragraphs {
+            body.push_str(&format!("<text:p>{}</text:p>", xml_escape(paragraph)));
+        }
+        body.push_str("</draw:text-box></draw:frame></draw:page>");
+    }
+    odf(
+        "application/vnd.oasis.opendocument.presentation",
+        &format!("<office:presentation>{body}</office:presentation>"),
+    )
+}

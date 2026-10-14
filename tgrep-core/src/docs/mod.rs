@@ -19,10 +19,18 @@
 //! | `.tar` | one per member: `!member` |
 //! | `.tar.gz`, `.tgz` | one per member: `!member` |
 //! | `.gz` | the decompressed stream, adapted by the name without `.gz` |
+//! | `.docx` `.docm` `.dotx` `.dotm` | one per paragraph with text: `#para=N` |
+//! | `.pptx` `.pptm` `.potx` `.potm` `.ppsx` `.ppsm` | one per slide: `#slide=N` |
+//! | `.xlsx` `.xlsm` `.xltx` `.xltm` | one per cell with a value: `#sheet=NAME!B7` |
+//! | `.odt` `.ott` | one per paragraph or heading with text: `#para=N` |
+//! | `.odp` `.otp` | one per page: `#slide=N` |
+//! | `.ods` `.ots` | one per cell with text: `#sheet=NAME!B7` |
 //!
 //! Members are adapted by their own names, so archives nest (`a.zip!b.tar.gz!c.pdf#page=2`)
 //! up to [`Limits::depth`] containers. A member with no adapter is text if it decodes
-//! to text, and is skipped if it is binary.
+//! to text, and is skipped if it is binary. An HTML member (`.html`, `.htm`,
+//! `.xhtml`) is read as its visible text, line for line with its source; an HTML
+//! file on disk is source code and is indexed as written.
 //!
 //! # Location syntax
 //!
@@ -35,9 +43,10 @@
 //! nested.zip!inner.tar.gz!slides.pdf#page=1:1:Agenda
 //! ```
 //!
-//! `MEMBER` is a member's path inside its archive and `UNIT` is `page=N` (1-based).
-//! In member names `%`, `!`, `#`, `:` and control characters are written as `%XX`,
-//! so the location parses back exactly. `LINE` counts from the start of the part.
+//! `MEMBER` is a member's path inside its archive and `UNIT` is `page=N`, `slide=N`,
+//! `para=N` (1-based) or `sheet=NAME!CELL`. In member and sheet names `%`, `!`, `#`,
+//! `:` and control characters are written as `%XX`, so the location parses back
+//! exactly. `LINE` counts from the start of the part.
 //! [`Loc::json`] gives the same fields as a JSON object.
 //!
 //! # Cache
@@ -65,6 +74,8 @@ use std::time::{Duration, Instant};
 
 mod archive;
 mod cache;
+mod html;
+mod office;
 mod pdf;
 
 pub use cache::Cache;
@@ -86,6 +97,14 @@ pub(crate) enum Kind {
     Tar,
     TarGz,
     Gz,
+    Docx,
+    Pptx,
+    Xlsx,
+    Odt,
+    Ods,
+    Odp,
+    /// Read only as an archive member.
+    Html,
 }
 
 impl Kind {
@@ -100,10 +119,27 @@ impl Kind {
                 "zip" => Self::Zip,
                 "tar" => Self::Tar,
                 "gz" => Self::Gz,
+                "docx" | "docm" | "dotx" | "dotm" => Self::Docx,
+                "pptx" | "pptm" | "potx" | "potm" | "ppsx" | "ppsm" => Self::Pptx,
+                "xlsx" | "xlsm" | "xltx" | "xltm" => Self::Xlsx,
+                "odt" | "ott" => Self::Odt,
+                "ods" | "ots" => Self::Ods,
+                "odp" | "otp" => Self::Odp,
+                "html" | "htm" | "xhtml" => Self::Html,
                 _ => return None,
             }
         };
         Some(kind)
+    }
+
+    /// The adapter for a file on disk, which is never read as HTML.
+    pub(crate) fn on_disk(name: &str) -> Option<Self> {
+        Self::of(name).filter(|kind| *kind != Self::Html)
+    }
+
+    /// Whether the kind holds members, and so counts toward [`Limits::depth`].
+    fn container(self) -> bool {
+        matches!(self, Self::Zip | Self::Tar | Self::TarGz | Self::Gz)
     }
 
     fn label(self) -> &'static str {
@@ -113,6 +149,13 @@ impl Kind {
             Self::Tar => "tar",
             Self::TarGz => "tar.gz",
             Self::Gz => "gz",
+            Self::Docx => "docx",
+            Self::Pptx => "pptx",
+            Self::Xlsx => "xlsx",
+            Self::Odt => "odt",
+            Self::Ods => "ods",
+            Self::Odp => "odp",
+            Self::Html => "html",
         }
     }
 }
@@ -121,7 +164,7 @@ impl Kind {
 pub fn handles(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| Kind::of(name).is_some())
+        .is_some_and(|name| Kind::on_disk(name).is_some())
 }
 
 /// Where a part of a document's text came from.
@@ -135,9 +178,17 @@ pub struct Loc {
 
 /// A numbered unit inside a document.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Unit {
     /// A PDF page, 1-based.
     Page(u32),
+    /// A presentation slide, 1-based in presentation order.
+    Slide(u32),
+    /// A paragraph of a text document, 1-based, counting every paragraph in
+    /// document order whether it has text or not.
+    Para(u32),
+    /// A spreadsheet cell: its sheet's name and its reference (`B7`).
+    Cell { sheet: Arc<str>, cell: String },
 }
 
 impl Loc {
@@ -167,6 +218,15 @@ impl Loc {
                 let (key, value) = unit.split_once('=')?;
                 match key {
                     "page" => Some(Unit::Page(value.parse().ok()?)),
+                    "slide" => Some(Unit::Slide(value.parse().ok()?)),
+                    "para" => Some(Unit::Para(value.parse().ok()?)),
+                    "sheet" => {
+                        let (sheet, cell) = value.rsplit_once('!')?;
+                        Some(Unit::Cell {
+                            sheet: unescape(sheet)?.into(),
+                            cell: cell.to_string(),
+                        })
+                    }
                     _ => return None,
                 }
             }
@@ -178,7 +238,7 @@ impl Loc {
     }
 
     /// The location as a JSON object: `members` (when inside an archive) and
-    /// the unit's key (`page`).
+    /// the unit's keys (`page`, `slide`, `para`, or `sheet` and `cell`).
     pub fn json(&self) -> serde_json::Value {
         let mut object = serde_json::Map::new();
         if !self.members.is_empty() {
@@ -187,6 +247,16 @@ impl Loc {
         match &self.unit {
             Some(Unit::Page(n)) => {
                 object.insert("page".into(), serde_json::json!(n));
+            }
+            Some(Unit::Slide(n)) => {
+                object.insert("slide".into(), serde_json::json!(n));
+            }
+            Some(Unit::Para(n)) => {
+                object.insert("para".into(), serde_json::json!(n));
+            }
+            Some(Unit::Cell { sheet, cell }) => {
+                object.insert("sheet".into(), serde_json::json!(sheet.as_ref()));
+                object.insert("cell".into(), serde_json::json!(cell));
             }
             None => {}
         }
@@ -201,6 +271,9 @@ impl fmt::Display for Loc {
         }
         match &self.unit {
             Some(Unit::Page(n)) => write!(f, "#page={n}"),
+            Some(Unit::Slide(n)) => write!(f, "#slide={n}"),
+            Some(Unit::Para(n)) => write!(f, "#para={n}"),
+            Some(Unit::Cell { sheet, cell }) => write!(f, "#sheet={}!{cell}", escape(sheet)),
             None => Ok(()),
         }
     }
@@ -467,7 +540,7 @@ struct Out {
 
 impl Out {
     fn push(&mut self, loc: Loc, text: &str, budget: &mut Budget) {
-        let text = text.trim_end_matches(['\n', '\r']);
+        let text = text.trim_end();
         if text.trim().is_empty() {
             return;
         }
@@ -490,48 +563,67 @@ impl Out {
     }
 }
 
-/// Read a document, or member, by the adapter its name selects.
+/// Read a document, or member, by the adapter its name selects. `depth` is
+/// the number of containers it is in, itself included when it is one.
 fn adapt(
     kind: Kind,
     name: &str,
     bytes: &[u8],
     chain: &Arc<[String]>,
+    depth: u32,
     budget: &mut Budget,
     out: &mut Out,
 ) -> Result<(), Reason> {
     budget.check()?;
     match kind {
         Kind::Pdf => pdf::extract(bytes, chain, budget, out),
-        Kind::Zip => archive::zip(bytes, chain, budget, out),
-        Kind::Tar => archive::tar(bytes, false, chain, budget, out),
-        Kind::TarGz => archive::tar(bytes, true, chain, budget, out),
+        Kind::Zip => archive::zip(bytes, chain, depth, budget, out),
+        Kind::Tar => archive::tar(bytes, false, chain, depth, budget, out),
+        Kind::TarGz => archive::tar(bytes, true, chain, depth, budget, out),
         Kind::Gz => {
             let data = archive::gunzip(bytes, budget)?;
             let inner = name.rsplit(['/', '\\']).next().unwrap_or(name);
             let inner = &inner[..inner.len() - 3];
-            member(inner, &data, chain.clone(), budget, out)
+            member(inner, &data, chain.clone(), depth, budget, out)
+        }
+        Kind::Docx => office::docx(bytes, chain, budget, out),
+        Kind::Pptx => office::pptx(bytes, chain, budget, out),
+        Kind::Xlsx => office::xlsx(bytes, chain, budget, out),
+        Kind::Odt => office::odf(office::Odf::Text, bytes, chain, budget, out),
+        Kind::Ods => office::odf(office::Odf::Sheet, bytes, chain, budget, out),
+        Kind::Odp => office::odf(office::Odf::Slides, bytes, chain, budget, out),
+        Kind::Html => {
+            let source = crate::encoding::decode(bytes, crate::encoding::EncodingMode::Auto);
+            let loc = Loc {
+                members: chain.clone(),
+                unit: None,
+            };
+            out.push(loc, &html::text(&source), budget);
+            Ok(())
         }
     }
 }
 
-/// Read one member: a nested document by its adapter, anything else as text.
-/// A member's failure is counted and does not fail its archive, except running
-/// out of time, which ends the whole document.
+/// Read one member of a container `depth` containers deep: a nested document
+/// by its adapter, anything else as text. A member's failure is counted and
+/// does not fail its archive, except running out of time, which ends the whole
+/// document.
 fn member(
     name: &str,
     bytes: &[u8],
     chain: Arc<[String]>,
+    depth: u32,
     budget: &mut Budget,
     out: &mut Out,
 ) -> Result<(), Reason> {
     match Kind::of(name) {
         Some(kind) => {
-            let depth = chain.len() as u32 + 1;
+            let depth = depth + u32::from(kind.container());
             if depth > budget.limits.depth {
                 budget.skipped.add(Reason::Depth);
                 return Ok(());
             }
-            match adapt(kind, name, bytes, &chain, budget, out) {
+            match adapt(kind, name, bytes, &chain, depth, budget, out) {
                 Ok(()) => Ok(()),
                 Err(Reason::Time) => Err(Reason::Time),
                 Err(reason) => {
@@ -566,7 +658,7 @@ fn member(
 /// Extract `bytes`, read by the adapter `name` selects, within `limits`.
 /// Never panics: an adapter's panic is [`Reason::Panic`].
 pub fn extract_with(name: &str, bytes: &[u8], limits: Limits) -> Result<Doc, Reason> {
-    let kind = Kind::of(name).ok_or(Reason::Unsupported)?;
+    let kind = Kind::on_disk(name).ok_or(Reason::Unsupported)?;
     let run = || {
         let mut budget = Budget::new(limits);
         let mut out = Out {
@@ -574,7 +666,16 @@ pub fn extract_with(name: &str, bytes: &[u8], limits: Limits) -> Result<Doc, Rea
             parts: Vec::new(),
             cap: limits.text,
         };
-        adapt(kind, name, bytes, &Arc::from([]), &mut budget, &mut out)?;
+        let depth = u32::from(kind.container());
+        adapt(
+            kind,
+            name,
+            bytes,
+            &Arc::from([]),
+            depth,
+            &mut budget,
+            &mut out,
+        )?;
         Ok(Doc {
             text: out.text,
             parts: out.parts,
@@ -609,7 +710,7 @@ pub fn load(name: &str, bytes: &[u8]) -> Result<Arc<Doc>, Reason> {
 
 /// [`load`] with an explicit cache.
 pub fn load_with(cache: Option<&Cache>, name: &str, bytes: &[u8]) -> Result<Arc<Doc>, Reason> {
-    let kind = Kind::of(name).ok_or(Reason::Unsupported)?;
+    let kind = Kind::on_disk(name).ok_or(Reason::Unsupported)?;
     let key = cache::key(kind, bytes);
     if let Some(found) = cache.and_then(|cache| cache.get(&key)) {
         STATS.cached.fetch_add(1, Ordering::Relaxed);
@@ -639,7 +740,7 @@ pub fn load_with(cache: Option<&Cache>, name: &str, bytes: &[u8]) -> Result<Arc<
 /// decoded file for anything else. A document that cannot be read yields a
 /// NUL, so the index treats it as binary and keeps only its name.
 pub fn index_text<'a>(name: &str, bytes: &'a [u8]) -> Cow<'a, [u8]> {
-    if Kind::of(name).is_none() {
+    if Kind::on_disk(name).is_none() {
         return crate::encoding::decode_for_index(bytes);
     }
     match load(name, bytes) {

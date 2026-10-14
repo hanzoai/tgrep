@@ -119,6 +119,7 @@ pub(super) fn gunzip(bytes: &[u8], budget: &mut Budget) -> Result<Vec<u8>, Reaso
 pub(super) fn zip(
     bytes: &[u8],
     chain: &Arc<[String]>,
+    depth: u32,
     budget: &mut Budget,
     out: &mut Out,
 ) -> Result<(), Reason> {
@@ -173,7 +174,14 @@ pub(super) fn zip(
             }
         };
         budget.read += data.len() as u64;
-        super::member(&name.clone(), &data, nested(chain, name), budget, out)?;
+        super::member(
+            &name.clone(),
+            &data,
+            nested(chain, name),
+            depth,
+            budget,
+            out,
+        )?;
     }
     Ok(())
 }
@@ -183,6 +191,7 @@ pub(super) fn tar(
     bytes: &[u8],
     gzip: bool,
     chain: &Arc<[String]>,
+    depth: u32,
     budget: &mut Budget,
     out: &mut Out,
 ) -> Result<(), Reason> {
@@ -193,7 +202,7 @@ pub(super) fn tar(
     };
     let counted = Counted::new(stream, budget.limits.total, budget.deadline);
     let mut archive = tar::Archive::new(counted);
-    let result = read_tar(&mut archive, chain, budget, out);
+    let result = read_tar(&mut archive, chain, depth, budget, out);
     match (result, archive.into_inner().tripped) {
         (Err(Reason::Corrupt), Some(reason)) => Err(reason),
         (result, _) => result,
@@ -203,6 +212,7 @@ pub(super) fn tar(
 fn read_tar<R: Read>(
     archive: &mut tar::Archive<R>,
     chain: &Arc<[String]>,
+    depth: u32,
     budget: &mut Budget,
     out: &mut Out,
 ) -> Result<(), Reason> {
@@ -242,7 +252,59 @@ fn read_tar<R: Read>(
             Err(_) => return Err(Reason::Corrupt),
         };
         budget.read += data.len() as u64;
-        super::member(&name.clone(), &data, nested(chain, name), budget, out)?;
+        super::member(
+            &name.clone(),
+            &data,
+            nested(chain, name),
+            depth,
+            budget,
+            out,
+        )?;
     }
     Ok(())
+}
+
+/// A zip package whose parts are read by name: the container of every office
+/// format.
+pub(super) struct Package<'a> {
+    archive: zip::ZipArchive<std::io::Cursor<&'a [u8]>>,
+}
+
+impl<'a> Package<'a> {
+    pub(super) fn open(bytes: &'a [u8]) -> Result<Self, Reason> {
+        let archive =
+            zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|_| Reason::Corrupt)?;
+        Ok(Self { archive })
+    }
+
+    /// The part named `name` as text, `None` when the package has no such
+    /// part. A part past the budget fails the document.
+    pub(super) fn text(
+        &mut self,
+        name: &str,
+        budget: &mut Budget,
+    ) -> Result<Option<String>, Reason> {
+        budget.check()?;
+        let file = match self.archive.by_name(name) {
+            Ok(file) => file,
+            Err(zip::result::ZipError::FileNotFound) => return Ok(None),
+            Err(zip::result::ZipError::UnsupportedArchive(_)) => return Err(Reason::Unsupported),
+            Err(_) => return Err(Reason::Corrupt),
+        };
+        if file.encrypted() {
+            return Err(Reason::Encrypted);
+        }
+        let room = budget.room();
+        if file.size() > room {
+            return Err(overflow(budget));
+        }
+        let data = read_bounded(file, room)
+            .map_err(|_| Reason::Corrupt)?
+            .ok_or_else(|| overflow(budget))?;
+        budget.read += data.len() as u64;
+        Ok(Some(crate::encoding::decode(
+            &data,
+            crate::encoding::EncodingMode::Auto,
+        )))
+    }
 }

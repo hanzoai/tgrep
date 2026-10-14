@@ -80,7 +80,7 @@ fn page_text(
     let mut font: Option<&Encoding> = None;
     let mut line_y: Option<f32> = None;
     for (i, op) in content.operations.iter().enumerate() {
-        if i % CHECK_EVERY == 0 {
+        if i.is_multiple_of(CHECK_EVERY) {
             budget.check()?;
         }
         let operands = &op.operands;

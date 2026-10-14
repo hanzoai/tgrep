@@ -1381,16 +1381,23 @@ cargo build --release --features docs
 tgrep index . && tgrep -n -- "quarterly revenue" .
 ```
 
-PDF, zip, tar, tar.gz/tgz and gz files are read by in-process adapters. Their
-extracted text goes into the same trigram index as source files, so a query over
+PDF, office, zip, tar, tar.gz/tgz and gz files are read by in-process
+adapters. Their extracted text goes into the same trigram index as source files, so a query over
 documents costs what a query over code costs, and the server, the on-disk index
 and `--no-index` all search the same text.
 
 | Extension | Unit of a hit |
 |---|---|
 | `.pdf` | page: `#page=N` |
+| `.docx` `.docm` `.dotx` `.dotm`, `.odt` `.ott` | paragraph: `#para=N`, counting every paragraph in document order |
+| `.pptx` `.pptm` `.potx` `.potm` `.ppsx` `.ppsm`, `.odp` `.otp` | slide: `#slide=N`, in presentation order |
+| `.xlsx` `.xlsm` `.xltx` `.xltm`, `.ods` `.ots` | cell: `#sheet=NAME!B7` |
 | `.zip`, `.tar`, `.tar.gz`, `.tgz` | member: `!path/in/archive` (members are adapted by their own names, so archives nest) |
 | `.gz` | the decompressed stream, adapted by the name without `.gz` |
+
+An HTML member of an archive (a saved site, a wiki export) is read as its visible
+text, line for line with its source. An HTML file on disk is source code and is
+indexed as written, so markup and attributes stay searchable.
 
 Every hit is one line:
 
@@ -1400,13 +1407,17 @@ PATH[!MEMBER]...[#UNIT]:LINE:TEXT
 docs/report.pdf#page=2:14:quarterly revenue
 docs/bundle.zip!notes/todo.txt:3:call the bank
 logs.tar.gz!deep.zip!deep.txt:2:deep needle
+deck.pptx#slide=4:2:Closing remarks
+book.xlsx#sheet=Q1!B7:1:needle total
 ```
 
-`MEMBER` is a path inside its archive, outermost first; `UNIT` is `page=N`
-(1-based, the PDF open-parameters form). In member names `%`, `!`, `#`, `:` and
-control characters are written `%XX`. `LINE` counts from the start of the page
-or member. `--json` events carry the same location as an object,
-`"location": {"path": "docs/report.pdf", "members": [...], "page": 2}`. Each part
+`MEMBER` is a path inside its archive, outermost first; `UNIT` is `page=N`,
+`slide=N`, `para=N` (1-based; `page=N` is the PDF open-parameters form) or
+`sheet=NAME!CELL`. In member and sheet names `%`, `!`, `#`, `:` and control
+characters are written `%XX`. `LINE` counts from the start of the part. `--json`
+events carry the same location as an object, `"location": {"path":
+"docs/report.pdf", "members": [...], "page": 2}` (or `"slide"`, `"para"`, or
+`"sheet"` and `"cell"`). Each part
 is searched as a file of its own, so `-n`, `-c`, `-C` and `--vimgrep` stay inside
 it; `-l`, `--files-without-match` and `-q` judge the document as one file and
 print its path once. `-a` searches a document's raw bytes instead. Exit codes are

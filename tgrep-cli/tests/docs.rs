@@ -387,3 +387,116 @@ fn a_server_answers_documents_like_the_index() {
     let listed = run(&root, &["-l", "--", "needle"]);
     assert_eq!(listed.lines().len(), 7, "{}", listed.stdout);
 }
+
+/// Office documents and an exported site, beside one HTML file on disk.
+fn office(root: &Path) -> Vec<&'static str> {
+    let files: Vec<(&'static str, Vec<u8>)> = vec![
+        (
+            "office/memo.docx",
+            fixture::docx(&[
+                "Memo title",
+                "",
+                "first needle paragraph",
+                "tab\there needle\nsecond line",
+            ]),
+        ),
+        (
+            "office/deck.pptx",
+            fixture::pptx(&[&["Agenda", "needle on slide one"], &["Closing needle"]]),
+        ),
+        (
+            "office/book.xlsx",
+            fixture::xlsx(&[
+                (
+                    "Q1",
+                    &[("A1", "Revenue"), ("B7", "needle total"), ("C2", "42")],
+                ),
+                ("Q2!x", &[("A1", "needle odd sheet")]),
+            ]),
+        ),
+        (
+            "office/notes.odt",
+            fixture::odt(&["Heading needle", "body text", "needle body"]),
+        ),
+        (
+            "office/sheet.ods",
+            fixture::ods(&[("Data", &[&["a", "", "needle cell"], &["", "needle b2"]])]),
+        ),
+        (
+            "office/talk.odp",
+            fixture::odp(&[&["intro"], &["needle slide two", "more"]]),
+        ),
+        (
+            "office/site.zip",
+            fixture::zip(&[(
+                "index.html",
+                b"<html><body>\n<p>Hello <b>nee</b>dle &amp; co</p>\n</body></html>\n",
+            )]),
+        ),
+        (
+            "office/page.html",
+            b"<p>needle <b>raw</b> html</p>\n".to_vec(),
+        ),
+    ];
+    for (path, data) in &files {
+        let full = root.join(path);
+        fs::create_dir_all(full.parent().unwrap()).unwrap();
+        fs::write(full, data).unwrap();
+    }
+    files.into_iter().map(|(path, _)| path).collect()
+}
+
+#[test]
+fn office_hits_name_the_paragraph_slide_and_cell() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("repo");
+    fs::create_dir_all(root.join(".git")).unwrap();
+    let files = office(&root);
+    index(&root);
+    let found = run(&root, &["-n", "--", "needle"]);
+    let expected: BTreeSet<String> = [
+        "office/memo.docx#para=3:1:first needle paragraph",
+        "office/memo.docx#para=4:1:tab\there needle",
+        "office/deck.pptx#slide=1:2:needle on slide one",
+        "office/deck.pptx#slide=2:1:Closing needle",
+        "office/book.xlsx#sheet=Q1!B7:1:needle total",
+        "office/book.xlsx#sheet=Q2%21x!A1:1:needle odd sheet",
+        "office/notes.odt#para=1:1:Heading needle",
+        "office/notes.odt#para=3:1:needle body",
+        "office/sheet.ods#sheet=Data!C1:1:needle cell",
+        "office/sheet.ods#sheet=Data!B2:1:needle b2",
+        "office/talk.odp#slide=2:1:needle slide two",
+        "office/site.zip!index.html:2: Hello needle & co",
+        "office/page.html:1:<p>needle <b>raw</b> html</p>",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    assert_eq!(found.lines(), expected, "{}", found.stderr);
+    for pattern in [
+        "needle",
+        "(?i)^(agenda|revenue|intro)$",
+        "42",
+        "second line",
+    ] {
+        let expected = scan(&root, &files, pattern);
+        assert!(!expected.is_empty(), "{pattern}");
+        for mode in [&[][..], &["--no-index"][..]] {
+            let mut args = vec!["-n"];
+            args.extend_from_slice(mode);
+            args.extend_from_slice(&["--", pattern]);
+            assert_eq!(run(&root, &args).lines(), expected, "{pattern} {mode:?}");
+        }
+    }
+    let json = run(&root, &["--json", "--", "odd sheet"]);
+    let event: serde_json::Value = json
+        .stdout
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|event| event["type"] == "match")
+        .unwrap();
+    assert_eq!(
+        event["data"]["location"],
+        serde_json::json!({"path": "office/book.xlsx", "sheet": "Q2!x", "cell": "A1"})
+    );
+}

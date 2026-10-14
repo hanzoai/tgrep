@@ -497,3 +497,153 @@ fn index_text_marks_unreadable_documents_binary() {
     let bytes = zip(&[("a.txt", b"zipped text\n"), ("b.txt", b"nul\0member\n")]);
     assert_eq!(index_text("a.zip", &bytes).as_ref(), b"zipped text\n");
 }
+
+fn package(entries: &[(&str, &str)]) -> Vec<u8> {
+    let entries: Vec<(&str, &[u8])> = entries.iter().map(|(n, x)| (*n, x.as_bytes())).collect();
+    zip(&entries)
+}
+
+#[test]
+fn docx_numbers_every_paragraph_and_reads_runs_only() {
+    let document = r#"<w:document xmlns:w="w"><w:body>
+        <w:p><w:r><w:t>One</w:t><w:tab/><w:t xml:space="preserve"> two </w:t></w:r></w:p>
+        <w:p/>
+        <w:p><w:r><w:t>Kept</w:t></w:r><w:del><w:r><w:delText>deleted</w:delText></w:r></w:del>
+          <w:r><w:fldChar/><w:instrText>PAGE</w:instrText><w:t>&amp; &#x263A;</w:t><w:br/><w:t>next</w:t></w:r>
+          <w:r><w:pict><w:txbxContent><w:p><w:r><w:t>boxed</w:t></w:r></w:p></w:txbxContent></w:pict></w:r></w:p>
+        <w:tbl><w:tr><w:tc><w:p><w:r><w:t>cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+    </w:body></w:document>"#;
+    let doc = extract("m.docx", &package(&[("word/document.xml", document)])).unwrap();
+    assert_eq!(
+        shown(&doc),
+        vec![
+            ("#para=1".into(), "One\t two\n".into()),
+            ("#para=3".into(), "Kept& \u{263A}\nnext\n".into()),
+            ("#para=4".into(), "boxed\n".into()),
+            ("#para=5".into(), "cell\n".into()),
+        ]
+    );
+    assert_eq!(
+        extract("m.docx", &package(&[("other.xml", "<x/>")])),
+        Err(Reason::Corrupt)
+    );
+    assert_eq!(
+        extract("m.docx", &package(&[("word/document.xml", "<w:p></w:x>")])),
+        Err(Reason::Corrupt)
+    );
+}
+
+#[test]
+fn xlsx_cells_without_references_count_from_their_row() {
+    let workbook =
+        r#"<workbook xmlns:r="r"><sheets><sheet name="S" r:id="a"/></sheets></workbook>"#;
+    let rels = r#"<Relationships><Relationship Id="a" Target="/xl/data/s.xml"/></Relationships>"#;
+    let sheet = r#"<worksheet><sheetData>
+        <row><c t="inlineStr"><is><t>first</t></is></c><c t="b"><v>1</v></c></row>
+        <row r="5"><c/><c t="str"><f>A1</f><v>formula value</v></c><c r="AA5"><v>3.5</v></c></row>
+    </sheetData></worksheet>"#;
+    let doc = extract(
+        "b.xlsx",
+        &package(&[
+            ("xl/workbook.xml", workbook),
+            ("xl/_rels/workbook.xml.rels", rels),
+            ("xl/data/s.xml", sheet),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(
+        shown(&doc),
+        vec![
+            ("#sheet=S!A1".into(), "first\n".into()),
+            ("#sheet=S!B1".into(), "TRUE\n".into()),
+            ("#sheet=S!B5".into(), "formula value\n".into()),
+            ("#sheet=S!AA5".into(), "3.5\n".into()),
+        ]
+    );
+    assert_eq!(super::office::column(0), "A");
+    assert_eq!(super::office::column(25), "Z");
+    assert_eq!(super::office::column(26), "AA");
+    assert_eq!(super::office::column(701), "ZZ");
+    assert_eq!(super::office::column(702), "AAA");
+}
+
+#[test]
+fn ods_expands_repeated_cells_within_the_bound() {
+    let content = r#"<office:document-content xmlns:office="o" xmlns:table="t" xmlns:text="x"><office:body><office:spreadsheet>
+        <table:table table:name="T">
+          <table:table-row><table:table-cell table:number-columns-repeated="2"/><table:table-cell><text:p>c1</text:p><text:p>more<text:s text:c="2"/>x</text:p></table:table-cell></table:table-row>
+          <table:table-row table:number-rows-repeated="2"><table:table-cell table:number-columns-repeated="2"><text:p>rep</text:p></table:table-cell></table:table-row>
+          <table:table-row table:number-rows-repeated="1048570"><table:table-cell table:number-columns-repeated="1024"/></table:table-row>
+        </table:table></office:spreadsheet></office:body></office:document-content>"#;
+    let doc = extract("s.ods", &package(&[("content.xml", content)])).unwrap();
+    assert_eq!(
+        shown(&doc),
+        vec![
+            ("#sheet=T!C1".into(), "c1\nmore  x\n".into()),
+            ("#sheet=T!A2".into(), "rep\n".into()),
+            ("#sheet=T!B2".into(), "rep\n".into()),
+            ("#sheet=T!A3".into(), "rep\n".into()),
+            ("#sheet=T!B3".into(), "rep\n".into()),
+        ]
+    );
+}
+
+#[test]
+fn html_members_are_read_as_visible_text() {
+    let bytes = zip(&[
+        (
+            "site/index.html",
+            b"<p>Fish &amp; <i>chips</i></p>\n<script>var x;</script>",
+        ),
+        ("site/raw.txt", b"<p>kept as written</p>\n"),
+    ]);
+    let doc = extract("export.zip", &bytes).unwrap();
+    assert_eq!(
+        shown(&doc),
+        vec![
+            ("!site/index.html".into(), " Fish & chips\n".into()),
+            ("!site/raw.txt".into(), "<p>kept as written</p>\n".into()),
+        ]
+    );
+    assert_eq!(extract("page.html", b"<p>x</p>"), Err(Reason::Unsupported));
+    assert!(!handles(Path::new("page.html")));
+    assert!(handles(Path::new("deck.PPTX")));
+}
+
+#[test]
+fn office_units_print_and_parse_back() {
+    for (unit, text) in [
+        (Unit::Slide(3), "#slide=3"),
+        (Unit::Para(12), "#para=12"),
+        (
+            Unit::Cell {
+                sheet: Arc::from("Q1 #2!x"),
+                cell: "B7".into(),
+            },
+            "#sheet=Q1 %232%21x!B7",
+        ),
+    ] {
+        let loc = Loc {
+            members: Arc::from([]),
+            unit: Some(unit),
+        };
+        assert_eq!(loc.to_string(), text);
+        assert_eq!(Loc::parse(text), Some(loc));
+    }
+    let cell = Loc::parse("!a.zip#sheet=S!C3").unwrap();
+    assert_eq!(
+        cell.json(),
+        serde_json::json!({"members": ["a.zip"], "sheet": "S", "cell": "C3"})
+    );
+}
+
+#[test]
+fn a_gzip_inside_gzip_counts_as_nesting() {
+    let mut data = gzip(b"core\n");
+    for _ in 0..6 {
+        data = gzip(&data);
+    }
+    let doc = extract("x.txt.gz.gz.gz.gz.gz.gz.gz", &data).unwrap();
+    assert!(doc.parts.is_empty());
+    assert_eq!(doc.skipped.get(Reason::Depth), 1);
+}
